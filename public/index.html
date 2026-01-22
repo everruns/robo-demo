@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robo Demo - Physics Simulation with Rapier</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            overflow: hidden;
+        }
+        #container { display: flex; height: 100vh; }
+        #canvas-container { flex: 1; position: relative; }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.5rem;
+            color: #e94560;
+        }
+        #sidebar {
+            width: 360px;
+            background: #16213e;
+            padding: 20px;
+            overflow-y: auto;
+            border-left: 1px solid #0f3460;
+        }
+        h1 { font-size: 1.4rem; margin-bottom: 20px; color: #e94560; }
+        h2 {
+            font-size: 1rem;
+            margin: 20px 0 10px;
+            color: #0f4c75;
+            border-bottom: 1px solid #0f3460;
+            padding-bottom: 5px;
+        }
+        .joint-control { margin-bottom: 15px; }
+        .joint-control label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 0.9rem;
+        }
+        .joint-control input[type="range"] { width: 100%; accent-color: #e94560; }
+        .joint-value { color: #e94560; font-family: monospace; }
+        .btn {
+            background: #e94560;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            margin: 5px 5px 5px 0;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: #ff6b6b; }
+        .btn-secondary { background: #0f4c75; }
+        .btn-secondary:hover { background: #1a6ca8; }
+        .btn-magnet {
+            background: #27ae60;
+            width: 100%;
+            padding: 15px;
+            font-size: 1rem;
+        }
+        .btn-magnet.active {
+            background: #e94560;
+            animation: magnetPulse 1s infinite;
+        }
+        @keyframes magnetPulse {
+            0%, 100% { box-shadow: 0 0 5px #e94560; }
+            50% { box-shadow: 0 0 20px #e94560; }
+        }
+        .physics-info {
+            background: #0d1b2a;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 0.8rem;
+            margin-top: 10px;
+        }
+        .physics-info div {
+            display: flex;
+            justify-content: space-between;
+            margin: 3px 0;
+        }
+        #end-effector-pos { font-family: monospace; color: #2ecc71; }
+        #magnet-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #555;
+            margin-left: 10px;
+            transition: all 0.3s;
+        }
+        #magnet-indicator.active {
+            background: #e94560;
+            box-shadow: 0 0 10px #e94560;
+        }
+        .object-list { margin-top: 10px; }
+        .object-item {
+            background: #0d1b2a;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 5px;
+            font-size: 0.85rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .object-item.attached { border-left: 3px solid #e94560; }
+        .hint { font-size: 0.75rem; color: #888; margin-top: 5px; }
+        .tab-container { display: flex; margin-bottom: 10px; }
+        .tab {
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+            background: #0d1b2a;
+            cursor: pointer;
+            border: none;
+            color: #888;
+            transition: all 0.2s;
+        }
+        .tab.active { background: #0f4c75; color: #fff; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        #status {
+            background: #0d1b2a;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            margin-top: 10px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .mcp-tool {
+            background: #0d1b2a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }
+        .mcp-tool h3 { font-size: 0.9rem; color: #e94560; margin-bottom: 10px; }
+        .mcp-tool input {
+            width: 100%;
+            background: #1a1a2e;
+            border: 1px solid #0f3460;
+            color: #eee;
+            padding: 8px;
+            border-radius: 3px;
+            margin-bottom: 10px;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="canvas-container">
+            <div id="loading">Loading Rapier Physics Engine...</div>
+            <canvas id="canvas"></canvas>
+        </div>
+        <div id="sidebar">
+            <h1>🤖 Robo Demo <span id="magnet-indicator"></span></h1>
+            <p class="hint">Physics powered by Rapier</p>
+
+            <div class="tab-container">
+                <button class="tab active" data-tab="controls">Controls</button>
+                <button class="tab" data-tab="mcp">MCP Inspector</button>
+            </div>
+
+            <div id="controls-tab" class="tab-content active">
+                <h2>Joint Controls</h2>
+                <div id="joint-controls"></div>
+
+                <h2>Magnet</h2>
+                <button class="btn btn-magnet" id="magnet-btn" onclick="toggleMagnet()">
+                    🧲 Magnet OFF
+                </button>
+                <p class="hint">Attracts metal objects within range when ON</p>
+
+                <h2>Actions</h2>
+                <button class="btn" onclick="resetArm()">Reset Position</button>
+                <button class="btn btn-secondary" onclick="resetObjects()">Reset Objects</button>
+
+                <h2>End Effector</h2>
+                <div class="physics-info">
+                    <div><span>Position:</span><span id="end-effector-pos">-</span></div>
+                    <div><span>Magnet:</span><span id="magnet-status">OFF</span></div>
+                </div>
+
+                <h2>Scene Objects</h2>
+                <p class="hint">Objects have physics - push them with the arm!</p>
+                <div id="object-list" class="object-list"></div>
+            </div>
+
+            <div id="mcp-tab" class="tab-content">
+                <h2>MCP Server Status</h2>
+                <div class="physics-info">
+                    <div><span>Endpoint:</span><span id="mcp-endpoint">-</span></div>
+                    <div><span>Connected:</span><span id="mcp-connected">No</span></div>
+                </div>
+
+                <h2>Test MCP Tools</h2>
+                <div class="mcp-tool">
+                    <h3>move_joint</h3>
+                    <input type="text" id="mcp-joint" placeholder="joint (0-5)">
+                    <input type="text" id="mcp-angle" placeholder="angle (degrees)">
+                    <button class="btn" onclick="testMoveJoint()">Execute</button>
+                </div>
+
+                <div class="mcp-tool">
+                    <h3>set_magnet</h3>
+                    <button class="btn" onclick="testMagnetOn()">ON</button>
+                    <button class="btn btn-secondary" onclick="testMagnetOff()">OFF</button>
+                </div>
+
+                <div class="mcp-tool">
+                    <h3>get_arm_state</h3>
+                    <button class="btn" onclick="testGetState()">Execute</button>
+                </div>
+
+                <h2>Response</h2>
+                <div id="status">Ready...</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import RAPIER from '@dimforge/rapier3d-compat';
+
+        // API Base URL
+        const API_BASE = window.location.origin;
+
+        // Configuration
+        const CONFIG = {
+            arm: {
+                baseHeight: 0.1,
+                segments: [
+                    { length: 0.25, radius: 0.05, axis: 'y', range: [-180, 180] },  // Base rotation
+                    { length: 0.35, radius: 0.045, axis: 'z', range: [-90, 90] },   // Shoulder
+                    { length: 0.30, radius: 0.04, axis: 'z', range: [-135, 135] },  // Elbow
+                    { length: 0.15, radius: 0.035, axis: 'x', range: [-180, 180] }, // Wrist roll
+                    { length: 0.12, radius: 0.03, axis: 'z', range: [-90, 90] },    // Wrist pitch
+                    { length: 0.08, radius: 0.025, axis: 'x', range: [-180, 180] }  // Wrist rotation
+                ],
+                jointSpeed: 2.0, // radians per second
+                magnetRadius: 0.12,
+                magnetStrength: 15.0
+            },
+            objects: [
+                { id: 'cube1', type: 'cube', position: [0.4, 0.025, 0.3], size: 0.05, color: 0xc0c0c0 },
+                { id: 'cube2', type: 'cube', position: [-0.3, 0.025, 0.4], size: 0.04, color: 0xa0a0a0 },
+                { id: 'cylinder1', type: 'cylinder', position: [0.25, 0.03, -0.35], size: 0.03, color: 0xd0d0d0 }
+            ]
+        };
+
+        // State
+        let world, eventQueue;
+        let jointTargets = [0, 0, 0, 0, 0, 0];
+        let jointAngles = [0, 0, 0, 0, 0, 0];
+        let magnetOn = false;
+        let attachedObject = null;
+        let magnetConstraint = null;
+
+        // Three.js objects
+        let scene, camera, renderer, controls;
+        const armSegments = [];
+        const jointGroups = [];
+        const objectMeshes = new Map();
+        const objectBodies = new Map();
+        let magnetBall = null;
+
+        // Rapier bodies
+        let armBodies = [];
+        let armJoints = [];
+
+        // Load persisted state from server
+        async function loadPersistedState() {
+            try {
+                const res = await fetch(`${API_BASE}/api/state`);
+                const state = await res.json();
+
+                if (state.jointTargets) {
+                    jointTargets = [...state.jointTargets];
+                    jointAngles = [...state.jointTargets]; // Start at target position
+                }
+                if (state.magnetOn !== undefined) {
+                    magnetOn = state.magnetOn;
+                }
+                if (state.objects) {
+                    // Update CONFIG with persisted positions
+                    state.objects.forEach(obj => {
+                        const configObj = CONFIG.objects.find(c => c.id === obj.id);
+                        if (configObj && obj.position) {
+                            configObj.position = [obj.position.x, obj.position.y, obj.position.z];
+                        }
+                    });
+                }
+            } catch (e) {
+                console.log('Could not load persisted state');
+            }
+        }
+
+        // Save object positions to server periodically
+        function saveObjectPositions() {
+            const objects = [];
+            objectBodies.forEach(({ body, config }, id) => {
+                const pos = body.translation();
+                objects.push({
+                    id,
+                    position: { x: pos.x, y: pos.y, z: pos.z }
+                });
+            });
+
+            fetch(`${API_BASE}/api/objects`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ objects })
+            }).catch(() => {});
+        }
+
+        // Initialize
+        async function init() {
+            // Load persisted state first
+            await loadPersistedState();
+
+            // Initialize Rapier
+            await RAPIER.init();
+            document.getElementById('loading').style.display = 'none';
+
+            // Create physics world
+            const gravity = { x: 0.0, y: -9.81, z: 0.0 };
+            world = new RAPIER.World(gravity);
+            eventQueue = new RAPIER.EventQueue(true);
+
+            // Setup Three.js
+            setupThreeJS();
+
+            // Create scene
+            createGround();
+            createArm();
+            createObjects();
+            createJointControls();
+            setupMouseDragging();
+
+            // Connect to server
+            connectSSE();
+
+            // Start animation loop
+            animate();
+        }
+
+        function setupThreeJS() {
+            const canvas = document.getElementById('canvas');
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xd0d8e0);
+
+            camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1000);
+            camera.position.set(1.5, 1.2, 1.5);
+
+            renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.target.set(0, 0.4, 0);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            directionalLight.position.set(5, 10, 5);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            scene.add(directionalLight);
+
+            const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+            fillLight.position.set(-5, 5, -5);
+            scene.add(fillLight);
+
+            // Grid
+            const gridHelper = new THREE.GridHelper(4, 20, 0x607080, 0x8090a0);
+            scene.add(gridHelper);
+
+            window.addEventListener('resize', () => {
+                camera.aspect = container.clientWidth / container.clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(container.clientWidth, container.clientHeight);
+            });
+        }
+
+        function createGround() {
+            // Visual ground
+            const groundGeometry = new THREE.PlaneGeometry(4, 4);
+            const groundMaterial = new THREE.MeshStandardMaterial({
+                color: 0xa8b5c4,
+                roughness: 0.8,
+                metalness: 0.1
+            });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // Physics ground (static collider)
+            const groundColliderDesc = RAPIER.ColliderDesc.cuboid(2, 0.01, 2)
+                .setTranslation(0, -0.01, 0);
+            world.createCollider(groundColliderDesc);
+        }
+
+        function createArm() {
+            const { baseHeight, segments } = CONFIG.arm;
+
+            // Base (fixed)
+            const baseGeometry = new THREE.CylinderGeometry(0.12, 0.15, baseHeight, 32);
+            const baseMaterial = new THREE.MeshStandardMaterial({
+                color: 0x0f4c75,
+                roughness: 0.3,
+                metalness: 0.7
+            });
+            const baseMesh = new THREE.Mesh(baseGeometry, baseMaterial);
+            baseMesh.position.y = baseHeight / 2;
+            baseMesh.castShadow = true;
+            scene.add(baseMesh);
+
+            // Base physics body (fixed)
+            const baseBodyDesc = RAPIER.RigidBodyDesc.fixed()
+                .setTranslation(0, baseHeight / 2, 0);
+            const baseBody = world.createRigidBody(baseBodyDesc);
+            const baseColliderDesc = RAPIER.ColliderDesc.cylinder(baseHeight / 2, 0.12);
+            world.createCollider(baseColliderDesc, baseBody);
+            armBodies.push(baseBody);
+
+            // Create arm segments with revolute joints
+            let parentBody = baseBody;
+            let yOffset = baseHeight;
+
+            for (let i = 0; i < segments.length; i++) {
+                const seg = segments[i];
+                const segGroup = new THREE.Group();
+                jointGroups.push(segGroup);
+
+                // Joint sphere
+                const jointGeometry = new THREE.SphereGeometry(seg.radius * 1.2, 16, 16);
+                const jointMaterial = new THREE.MeshStandardMaterial({
+                    color: 0xe94560,
+                    roughness: 0.3,
+                    metalness: 0.6
+                });
+                const jointMesh = new THREE.Mesh(jointGeometry, jointMaterial);
+                jointMesh.castShadow = true;
+                segGroup.add(jointMesh);
+
+                // Segment cylinder
+                const segGeometry = new THREE.CylinderGeometry(seg.radius, seg.radius * 0.9, seg.length, 16);
+                const segMaterial = new THREE.MeshStandardMaterial({
+                    color: i % 2 === 0 ? 0x1e88e5 : 0x0f4c75,
+                    roughness: 0.4,
+                    metalness: 0.5
+                });
+                const segMesh = new THREE.Mesh(segGeometry, segMaterial);
+                segMesh.position.y = seg.length / 2;
+                segMesh.castShadow = true;
+                segGroup.add(segMesh);
+
+                segGroup.position.y = yOffset;
+                scene.add(segGroup);
+                armSegments.push(segGroup);
+
+                // Physics body for this segment (kinematic for motor control)
+                const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                    .setTranslation(0, yOffset + seg.length / 2, 0);
+                const body = world.createRigidBody(bodyDesc);
+
+                // Collider for the segment
+                const colliderDesc = RAPIER.ColliderDesc.cylinder(seg.length / 2, seg.radius)
+                    .setDensity(1.0);
+                world.createCollider(colliderDesc, body);
+
+                armBodies.push(body);
+                yOffset += seg.length;
+            }
+
+            // Add magnetic ball at end
+            createMagnetBall(yOffset);
+        }
+
+        function createMagnetBall(yOffset) {
+            const ballGeometry = new THREE.SphereGeometry(0.04, 32, 32);
+            const ballMaterial = new THREE.MeshStandardMaterial({
+                color: 0x444444,
+                roughness: 0.2,
+                metalness: 0.9
+            });
+            magnetBall = new THREE.Mesh(ballGeometry, ballMaterial);
+            magnetBall.position.y = yOffset;
+            magnetBall.castShadow = true;
+            scene.add(magnetBall);
+
+            // Glow ring
+            const ringGeometry = new THREE.TorusGeometry(0.05, 0.006, 8, 32);
+            const ringMaterial = new THREE.MeshBasicMaterial({ color: 0x555555 });
+            const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+            ring.rotation.x = Math.PI / 2;
+            magnetBall.add(ring);
+            magnetBall.ring = ring;
+        }
+
+        function createObjects() {
+            CONFIG.objects.forEach(objConfig => {
+                let geometry, colliderDesc;
+                const halfSize = objConfig.size / 2;
+
+                if (objConfig.type === 'cube') {
+                    geometry = new THREE.BoxGeometry(objConfig.size, objConfig.size, objConfig.size);
+                    colliderDesc = RAPIER.ColliderDesc.cuboid(halfSize, halfSize, halfSize);
+                } else if (objConfig.type === 'cylinder') {
+                    geometry = new THREE.CylinderGeometry(objConfig.size, objConfig.size, objConfig.size * 1.5, 16);
+                    colliderDesc = RAPIER.ColliderDesc.cylinder(objConfig.size * 0.75, objConfig.size);
+                } else {
+                    geometry = new THREE.SphereGeometry(objConfig.size, 16, 16);
+                    colliderDesc = RAPIER.ColliderDesc.ball(objConfig.size);
+                }
+
+                const material = new THREE.MeshStandardMaterial({
+                    color: objConfig.color,
+                    roughness: 0.3,
+                    metalness: 0.8
+                });
+
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(...objConfig.position);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                scene.add(mesh);
+                objectMeshes.set(objConfig.id, mesh);
+
+                // Physics body (dynamic)
+                const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+                    .setTranslation(...objConfig.position)
+                    .setLinearDamping(0.5)
+                    .setAngularDamping(0.5);
+                const body = world.createRigidBody(bodyDesc);
+
+                colliderDesc.setDensity(2.0)
+                    .setFriction(0.7)
+                    .setRestitution(0.3);
+                world.createCollider(colliderDesc, body);
+
+                objectBodies.set(objConfig.id, { body, config: objConfig, mesh });
+            });
+        }
+
+        // Mouse dragging for objects (User A can move objects)
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let isDragging = false;
+        let draggedObject = null;
+        let dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        function setupMouseDragging() {
+            const canvas = renderer.domElement;
+
+            canvas.addEventListener('mousedown', (event) => {
+                if (event.button !== 0) return; // Left click only
+
+                const rect = canvas.getBoundingClientRect();
+                mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+                raycaster.setFromCamera(mouse, camera);
+                const meshes = Array.from(objectMeshes.values());
+                const intersects = raycaster.intersectObjects(meshes);
+
+                if (intersects.length > 0) {
+                    const mesh = intersects[0].object;
+                    const objData = [...objectBodies.values()].find(d => d.mesh === mesh);
+
+                    // Don't drag if attached to magnet
+                    if (objData && !mesh.userData.attached) {
+                        isDragging = true;
+                        draggedObject = objData;
+                        controls.enabled = false;
+                        dragPlane.constant = -mesh.position.y;
+                    }
+                }
+            });
+
+            canvas.addEventListener('mousemove', (event) => {
+                if (!isDragging || !draggedObject) return;
+
+                const rect = canvas.getBoundingClientRect();
+                mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+                raycaster.setFromCamera(mouse, camera);
+                const intersectPoint = new THREE.Vector3();
+                raycaster.ray.intersectPlane(dragPlane, intersectPoint);
+
+                if (intersectPoint) {
+                    // Move physics body to new position
+                    draggedObject.body.setTranslation({
+                        x: intersectPoint.x,
+                        y: draggedObject.mesh.position.y,
+                        z: intersectPoint.z
+                    }, true);
+                    draggedObject.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    draggedObject.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                }
+            });
+
+            canvas.addEventListener('mouseup', () => {
+                isDragging = false;
+                draggedObject = null;
+                controls.enabled = true;
+            });
+
+            canvas.addEventListener('mouseleave', () => {
+                isDragging = false;
+                draggedObject = null;
+                controls.enabled = true;
+            });
+        }
+
+        function updateArmKinematics() {
+            const { segments } = CONFIG.arm;
+            let position = new THREE.Vector3(0, CONFIG.arm.baseHeight, 0);
+            let rotation = new THREE.Quaternion();
+
+            for (let i = 0; i < segments.length; i++) {
+                const seg = segments[i];
+                const angle = jointAngles[i] * Math.PI / 180;
+
+                // Apply rotation for this joint
+                const jointQuat = new THREE.Quaternion();
+                if (seg.axis === 'x') jointQuat.setFromAxisAngle(new THREE.Vector3(1, 0, 0), angle);
+                else if (seg.axis === 'y') jointQuat.setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+                else jointQuat.setFromAxisAngle(new THREE.Vector3(0, 0, 1), angle);
+
+                rotation.multiply(jointQuat);
+
+                // Update visual
+                if (jointGroups[i]) {
+                    jointGroups[i].position.copy(position);
+                    jointGroups[i].quaternion.copy(rotation);
+                }
+
+                // Update physics body
+                if (armBodies[i + 1]) {
+                    const segCenter = position.clone();
+                    const segOffset = new THREE.Vector3(0, seg.length / 2, 0);
+                    segOffset.applyQuaternion(rotation);
+                    segCenter.add(segOffset);
+
+                    armBodies[i + 1].setNextKinematicTranslation({
+                        x: segCenter.x,
+                        y: segCenter.y,
+                        z: segCenter.z
+                    });
+                    armBodies[i + 1].setNextKinematicRotation({
+                        x: rotation.x,
+                        y: rotation.y,
+                        z: rotation.z,
+                        w: rotation.w
+                    });
+                }
+
+                // Move position to end of this segment
+                const segEnd = new THREE.Vector3(0, seg.length, 0);
+                segEnd.applyQuaternion(rotation);
+                position.add(segEnd);
+            }
+
+            // Update magnet ball position
+            if (magnetBall) {
+                magnetBall.position.copy(position);
+                magnetBall.quaternion.copy(rotation);
+
+                // Visual feedback for magnet state
+                magnetBall.material.color.setHex(magnetOn ? 0xe94560 : 0x444444);
+                magnetBall.ring.material.color.setHex(magnetOn ? 0xff6b6b : 0x555555);
+                if (magnetOn) {
+                    magnetBall.material.emissive = new THREE.Color(0x330011);
+                } else {
+                    magnetBall.material.emissive = new THREE.Color(0x000000);
+                }
+            }
+
+            return position;
+        }
+
+        function updateMagneticForce() {
+            if (!magnetBall) return;
+
+            const magnetPos = magnetBall.position;
+            const { magnetRadius, magnetStrength } = CONFIG.arm;
+
+            objectBodies.forEach(({ body, config, mesh }, id) => {
+                const bodyPos = body.translation();
+                const dx = magnetPos.x - bodyPos.x;
+                const dy = magnetPos.y - bodyPos.y;
+                const dz = magnetPos.z - bodyPos.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (magnetOn) {
+                    if (mesh.userData.attached) {
+                        // Already attached - keep snapped to magnet position
+                        const snapOffset = config.size * 0.5 + 0.04; // object half-size + magnet radius
+                        body.setTranslation({
+                            x: magnetPos.x,
+                            y: magnetPos.y - snapOffset,
+                            z: magnetPos.z
+                        }, true);
+                        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                    } else if (dist < magnetRadius && dist > 0.01) {
+                        // Apply attractive force toward magnet
+                        const forceMag = magnetStrength / (dist * dist + 0.1);
+                        const force = {
+                            x: (dx / dist) * forceMag,
+                            y: (dy / dist) * forceMag,
+                            z: (dz / dist) * forceMag
+                        };
+                        body.applyImpulse(force, true);
+
+                        // If very close, snap and attach
+                        if (dist < 0.08) {
+                            mesh.userData.attached = true;
+                        }
+                    }
+                } else if (mesh.userData.attached) {
+                    // Magnet turned off - release object, let it fall
+                    mesh.userData.attached = false;
+                    // Give a tiny downward impulse to ensure it starts falling
+                    body.applyImpulse({ x: 0, y: -0.1, z: 0 }, true);
+                }
+            });
+        }
+
+        function syncPhysicsToVisuals() {
+            objectBodies.forEach(({ body, mesh }) => {
+                const pos = body.translation();
+                const rot = body.rotation();
+                mesh.position.set(pos.x, pos.y, pos.z);
+                mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+            });
+        }
+
+        function updateJointMotion(deltaTime) {
+            const speed = CONFIG.arm.jointSpeed * 180 / Math.PI * deltaTime; // degrees per frame
+            let moving = false;
+
+            for (let i = 0; i < 6; i++) {
+                const diff = jointTargets[i] - jointAngles[i];
+                if (Math.abs(diff) > 0.5) {
+                    moving = true;
+                    const step = Math.sign(diff) * Math.min(Math.abs(diff), speed);
+                    jointAngles[i] += step;
+                }
+            }
+
+            return moving;
+        }
+
+        // Animation loop
+        let lastTime = performance.now();
+        let lastSaveTime = 0;
+        const SAVE_INTERVAL = 2000; // Save state every 2 seconds
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            const deltaTime = (now - lastTime) / 1000;
+            lastTime = now;
+
+            // Update joint positions toward targets
+            updateJointMotion(deltaTime);
+
+            // Update arm kinematics
+            const endEffectorPos = updateArmKinematics();
+
+            // Step physics
+            world.step(eventQueue);
+
+            // Apply magnetic force
+            updateMagneticForce();
+
+            // Sync physics bodies to visuals
+            syncPhysicsToVisuals();
+
+            // Update UI
+            document.getElementById('end-effector-pos').textContent =
+                `(${endEffectorPos.x.toFixed(2)}, ${endEffectorPos.y.toFixed(2)}, ${endEffectorPos.z.toFixed(2)})`;
+
+            updateObjectList();
+
+            // Periodically save object positions
+            if (now - lastSaveTime > SAVE_INTERVAL) {
+                lastSaveTime = now;
+                saveObjectPositions();
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function updateObjectList() {
+            const listEl = document.getElementById('object-list');
+            listEl.innerHTML = '';
+            objectBodies.forEach(({ body, mesh, config }, id) => {
+                const pos = body.translation();
+                const attached = mesh.userData.attached || false;
+                const div = document.createElement('div');
+                div.className = 'object-item' + (attached ? ' attached' : '');
+                div.innerHTML = `
+                    <span>${id}</span>
+                    <span>${attached ? '🧲' : `(${pos.x.toFixed(2)}, ${pos.z.toFixed(2)})`}</span>
+                `;
+                listEl.appendChild(div);
+            });
+        }
+
+        function createJointControls() {
+            const container = document.getElementById('joint-controls');
+            CONFIG.arm.segments.forEach((seg, i) => {
+                const div = document.createElement('div');
+                div.className = 'joint-control';
+                div.innerHTML = `
+                    <label>
+                        <span>Joint ${i + 1} (${seg.axis.toUpperCase()})</span>
+                        <span class="joint-value" id="joint-${i}-value">${jointAngles[i]}°</span>
+                    </label>
+                    <input type="range" id="joint-${i}"
+                           min="${seg.range[0]}" max="${seg.range[1]}"
+                           value="${jointAngles[i]}" step="1">
+                `;
+                container.appendChild(div);
+
+                const slider = div.querySelector('input');
+                slider.addEventListener('input', (e) => {
+                    const angle = parseFloat(e.target.value);
+                    jointTargets[i] = angle;
+                    sendCommand('move_joint', { joint: i, angle });
+                });
+            });
+        }
+
+        // Server communication
+        document.getElementById('mcp-endpoint').textContent = `${API_BASE}/mcp`;
+
+        async function sendCommand(tool, args) {
+            try {
+                await fetch(`${API_BASE}/api/tools/${tool}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(args)
+                });
+            } catch (e) {
+                console.error('Command failed:', e);
+            }
+        }
+
+        function connectSSE() {
+            const eventSource = new EventSource(`${API_BASE}/api/events`);
+
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'connected') {
+                    document.getElementById('mcp-connected').textContent = 'Yes';
+                    document.getElementById('mcp-connected').style.color = '#2ecc71';
+                }
+                if (data.command) {
+                    handleServerCommand(data.command);
+                }
+            };
+
+            eventSource.onerror = () => {
+                document.getElementById('mcp-connected').textContent = 'Reconnecting...';
+                document.getElementById('mcp-connected').style.color = '#f39c12';
+                eventSource.close();
+                setTimeout(connectSSE, 2000);
+            };
+        }
+
+        function handleServerCommand(cmd) {
+            switch (cmd.type) {
+                case 'move_joint':
+                    if (cmd.joint >= 0 && cmd.joint < 6) {
+                        jointTargets[cmd.joint] = cmd.angle;
+                        const slider = document.getElementById(`joint-${cmd.joint}`);
+                        if (slider) slider.value = cmd.angle;
+                    }
+                    break;
+                case 'set_magnet':
+                    magnetOn = cmd.enabled;
+                    updateMagnetUI();
+                    break;
+                case 'reset_arm':
+                    jointTargets = [0, 0, 0, 0, 0, 0];
+                    magnetOn = false;
+                    updateMagnetUI();
+                    break;
+            }
+        }
+
+        function updateMagnetUI() {
+            const indicator = document.getElementById('magnet-indicator');
+            const btn = document.getElementById('magnet-btn');
+            const statusEl = document.getElementById('magnet-status');
+
+            if (magnetOn) {
+                indicator.classList.add('active');
+                btn.classList.add('active');
+                btn.textContent = '🧲 Magnet ON';
+                statusEl.textContent = 'ON';
+                statusEl.style.color = '#e94560';
+            } else {
+                indicator.classList.remove('active');
+                btn.classList.remove('active');
+                btn.textContent = '🧲 Magnet OFF';
+                statusEl.textContent = 'OFF';
+                statusEl.style.color = '#888';
+            }
+        }
+
+        // Global functions for UI
+        window.toggleMagnet = function() {
+            magnetOn = !magnetOn;
+            updateMagnetUI();
+            sendCommand('set_magnet', { enabled: magnetOn });
+        };
+
+        window.resetArm = function() {
+            jointTargets = [0, 0, 0, 0, 0, 0];
+            magnetOn = false;
+            updateMagnetUI();
+            sendCommand('reset_arm', {});
+        };
+
+        window.resetObjects = function() {
+            CONFIG.objects.forEach(objConfig => {
+                const data = objectBodies.get(objConfig.id);
+                if (data) {
+                    data.body.setTranslation({ x: objConfig.position[0], y: objConfig.position[1], z: objConfig.position[2] }, true);
+                    data.body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+                    data.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    data.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                    data.mesh.userData.attached = false;
+                }
+            });
+        };
+
+        window.testMoveJoint = async function() {
+            const joint = parseInt(document.getElementById('mcp-joint').value);
+            const angle = parseFloat(document.getElementById('mcp-angle').value);
+            jointTargets[joint] = angle;
+            await sendCommand('move_joint', { joint, angle });
+            logStatus(`move_joint(${joint}, ${angle})`);
+        };
+
+        window.testMagnetOn = async function() {
+            magnetOn = true;
+            updateMagnetUI();
+            await sendCommand('set_magnet', { enabled: true });
+            logStatus('set_magnet(true)');
+        };
+
+        window.testMagnetOff = async function() {
+            magnetOn = false;
+            updateMagnetUI();
+            await sendCommand('set_magnet', { enabled: false });
+            logStatus('set_magnet(false)');
+        };
+
+        window.testGetState = function() {
+            const state = {
+                jointAngles: jointAngles.map(a => Math.round(a)),
+                magnetOn,
+                endEffector: magnetBall ? {
+                    x: magnetBall.position.x.toFixed(3),
+                    y: magnetBall.position.y.toFixed(3),
+                    z: magnetBall.position.z.toFixed(3)
+                } : null
+            };
+            logStatus(JSON.stringify(state, null, 2));
+        };
+
+        function logStatus(msg) {
+            const status = document.getElementById('status');
+            const time = new Date().toLocaleTimeString();
+            status.innerHTML = `[${time}] ${msg}\n` + status.innerHTML;
+        }
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(`${tab.dataset.tab}-tab`).classList.add('active');
+            });
+        });
+
+        // Start
+        init().catch(console.error);
+    </script>
+</body>
+</html>
