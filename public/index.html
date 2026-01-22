@@ -246,6 +246,13 @@
         // API Base URL
         const API_BASE = window.location.origin;
 
+        // Default object positions (never modified - used for reset)
+        const DEFAULT_OBJECT_POSITIONS = {
+            'cube1': [0.4, 0.025, 0.3],
+            'cube2': [-0.3, 0.025, 0.4],
+            'cylinder1': [0.25, 0.03, -0.35]
+        };
+
         // Configuration
         const CONFIG = {
             arm: {
@@ -667,12 +674,15 @@
                     jointGroups[i].quaternion.copy(rotation);
                 }
 
-                // Update physics body
+                // Update physics body - clamp segment center above floor
                 if (armBodies[i + 1]) {
                     const segCenter = position.clone();
                     const segOffset = new THREE.Vector3(0, seg.length / 2, 0);
                     segOffset.applyQuaternion(rotation);
                     segCenter.add(segOffset);
+
+                    // Clamp segment center above floor (min height = segment radius)
+                    segCenter.y = Math.max(segCenter.y, seg.radius + 0.01);
 
                     armBodies[i + 1].setNextKinematicTranslation({
                         x: segCenter.x,
@@ -691,10 +701,14 @@
                 const segEnd = new THREE.Vector3(0, seg.length, 0);
                 segEnd.applyQuaternion(rotation);
                 position.add(segEnd);
+
+                // Clamp position above floor for next segment
+                position.y = Math.max(position.y, 0.02);
             }
 
-            // Update magnet ball position
+            // Update magnet ball position (clamp above floor)
             if (magnetBall) {
+                position.y = Math.max(position.y, 0.05); // Don't go below floor
                 magnetBall.position.copy(position);
                 magnetBall.quaternion.copy(rotation);
 
@@ -719,6 +733,18 @@
 
             objectBodies.forEach(({ body, config, mesh }, id) => {
                 const bodyPos = body.translation();
+
+                // SAFETY: Reset objects that have gone out of bounds
+                if (Math.abs(bodyPos.x) > 5 || Math.abs(bodyPos.y) > 5 || Math.abs(bodyPos.z) > 5) {
+                    console.log(`Resetting ${id} - out of bounds`);
+                    const origPos = DEFAULT_OBJECT_POSITIONS[id] || [0, 0.1, 0];
+                    body.setTranslation({ x: origPos[0], y: origPos[1], z: origPos[2] }, true);
+                    body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                    mesh.userData.attached = false;
+                    return;
+                }
+
                 const dx = magnetPos.x - bodyPos.x;
                 const dy = magnetPos.y - bodyPos.y;
                 const dz = magnetPos.z - bodyPos.z;
@@ -726,18 +752,18 @@
 
                 if (magnetOn) {
                     if (mesh.userData.attached) {
-                        // Already attached - keep snapped to magnet position
-                        const snapOffset = config.size * 0.5 + 0.04; // object half-size + magnet radius
+                        // Already attached - keep snapped BELOW magnet position
+                        const snapY = Math.max(magnetPos.y - 0.06, config.size * 0.5 + 0.01);
                         body.setTranslation({
                             x: magnetPos.x,
-                            y: magnetPos.y - snapOffset,
+                            y: snapY,
                             z: magnetPos.z
                         }, true);
                         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
                         body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-                    } else if (dist < magnetRadius && dist > 0.01) {
-                        // Apply attractive force toward magnet
-                        const forceMag = magnetStrength / (dist * dist + 0.1);
+                    } else if (dist < magnetRadius) {
+                        // Apply attractive force toward magnet (capped for stability)
+                        const forceMag = Math.min(magnetStrength / (dist * dist + 0.1), 50);
                         const force = {
                             x: (dx / dist) * forceMag,
                             y: (dy / dist) * forceMag,
@@ -748,13 +774,20 @@
                         // If very close, snap and attach
                         if (dist < 0.08) {
                             mesh.userData.attached = true;
+                            // Immediately set position to prevent physics instability
+                            const snapY = Math.max(magnetPos.y - 0.06, config.size * 0.5 + 0.01);
+                            body.setTranslation({ x: magnetPos.x, y: snapY, z: magnetPos.z }, true);
+                            body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                            body.setAngvel({ x: 0, y: 0, z: 0 }, true);
                         }
                     }
                 } else if (mesh.userData.attached) {
-                    // Magnet turned off - release object, let it fall
+                    // Magnet turned off - release object, let it fall straight down
                     mesh.userData.attached = false;
-                    // Give a tiny downward impulse to ensure it starts falling
-                    body.applyImpulse({ x: 0, y: -0.1, z: 0 }, true);
+                    // Zero out velocity and let gravity take over
+                    body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                    body.wakeUp();
                 }
             });
         }
@@ -799,16 +832,16 @@
             // Update joint positions toward targets
             updateJointMotion(deltaTime);
 
-            // Update arm kinematics
+            // Update arm kinematics BEFORE physics step
             const endEffectorPos = updateArmKinematics();
 
-            // Step physics
-            world.step(eventQueue);
-
-            // Apply magnetic force
+            // Apply magnetic force BEFORE physics step (modifies kinematic/dynamic bodies)
             updateMagneticForce();
 
-            // Sync physics bodies to visuals
+            // Step physics AFTER all kinematic updates
+            world.step(eventQueue);
+
+            // Sync physics bodies to visuals AFTER physics step
             syncPhysicsToVisuals();
 
             // Update UI
@@ -964,7 +997,9 @@
             CONFIG.objects.forEach(objConfig => {
                 const data = objectBodies.get(objConfig.id);
                 if (data) {
-                    data.body.setTranslation({ x: objConfig.position[0], y: objConfig.position[1], z: objConfig.position[2] }, true);
+                    // Use DEFAULT positions, not persisted positions
+                    const defaultPos = DEFAULT_OBJECT_POSITIONS[objConfig.id] || objConfig.position;
+                    data.body.setTranslation({ x: defaultPos[0], y: defaultPos[1], z: defaultPos[2] }, true);
                     data.body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
                     data.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
                     data.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
