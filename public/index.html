@@ -113,48 +113,6 @@
         }
         .object-item.attached { border-left: 3px solid #e94560; }
         .hint { font-size: 0.75rem; color: #888; margin-top: 5px; }
-        .tab-container { display: flex; margin-bottom: 10px; }
-        .tab {
-            flex: 1;
-            padding: 10px;
-            text-align: center;
-            background: #0d1b2a;
-            cursor: pointer;
-            border: none;
-            color: #888;
-            transition: all 0.2s;
-        }
-        .tab.active { background: #0f4c75; color: #fff; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        #status {
-            background: #0d1b2a;
-            padding: 10px;
-            border-radius: 5px;
-            font-family: monospace;
-            font-size: 0.8rem;
-            margin-top: 10px;
-            max-height: 150px;
-            overflow-y: auto;
-        }
-        .mcp-tool {
-            background: #0d1b2a;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 10px;
-        }
-        .mcp-tool h3 { font-size: 0.9rem; color: #e94560; margin-bottom: 10px; }
-        .mcp-tool input {
-            width: 100%;
-            background: #1a1a2e;
-            border: 1px solid #0f3460;
-            color: #eee;
-            padding: 8px;
-            border-radius: 3px;
-            margin-bottom: 10px;
-            font-family: monospace;
-            font-size: 0.85rem;
-        }
     </style>
 </head>
 <body>
@@ -167,12 +125,7 @@
             <h1>🤖 Robo Demo <span id="magnet-indicator"></span></h1>
             <p class="hint">Physics powered by Rapier</p>
 
-            <div class="tab-container">
-                <button class="tab active" data-tab="controls">Controls</button>
-                <button class="tab" data-tab="mcp">MCP Inspector</button>
-            </div>
-
-            <div id="controls-tab" class="tab-content active">
+            <div id="controls-tab">
                 <h2>Joint Controls</h2>
                 <div id="joint-controls"></div>
 
@@ -195,36 +148,11 @@
                 <h2>Scene Objects</h2>
                 <p class="hint">Objects have physics - push them with the arm!</p>
                 <div id="object-list" class="object-list"></div>
-            </div>
 
-            <div id="mcp-tab" class="tab-content">
-                <h2>MCP Server Status</h2>
+                <h2>MCP</h2>
                 <div class="physics-info">
-                    <div><span>Endpoint:</span><span id="mcp-endpoint">-</span></div>
-                    <div><span>Connected:</span><span id="mcp-connected">No</span></div>
+                    <div><span>Status:</span><span id="mcp-connected">Disconnected</span></div>
                 </div>
-
-                <h2>Test MCP Tools</h2>
-                <div class="mcp-tool">
-                    <h3>move_joint</h3>
-                    <input type="text" id="mcp-joint" placeholder="joint (0-5)">
-                    <input type="text" id="mcp-angle" placeholder="angle (degrees)">
-                    <button class="btn" onclick="testMoveJoint()">Execute</button>
-                </div>
-
-                <div class="mcp-tool">
-                    <h3>set_magnet</h3>
-                    <button class="btn" onclick="testMagnetOn()">ON</button>
-                    <button class="btn btn-secondary" onclick="testMagnetOff()">OFF</button>
-                </div>
-
-                <div class="mcp-tool">
-                    <h3>get_arm_state</h3>
-                    <button class="btn" onclick="testGetState()">Execute</button>
-                </div>
-
-                <h2>Response</h2>
-                <div id="status">Ready...</div>
             </div>
         </div>
     </div>
@@ -902,8 +830,6 @@
         }
 
         // Server communication
-        document.getElementById('mcp-endpoint').textContent = `${API_BASE}/mcp`;
-
         async function sendCommand(tool, args) {
             try {
                 await fetch(`${API_BASE}/api/tools/${tool}`, {
@@ -922,7 +848,7 @@
             eventSource.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 if (data.type === 'connected') {
-                    document.getElementById('mcp-connected').textContent = 'Yes';
+                    document.getElementById('mcp-connected').textContent = 'Connected';
                     document.getElementById('mcp-connected').style.color = '#2ecc71';
                 }
                 if (data.command) {
@@ -943,8 +869,15 @@
                 case 'move_joint':
                     if (cmd.joint >= 0 && cmd.joint < 6) {
                         jointTargets[cmd.joint] = cmd.angle;
-                        const slider = document.getElementById(`joint-${cmd.joint}`);
-                        if (slider) slider.value = cmd.angle;
+                        updateSliderUI(cmd.joint, cmd.angle);
+                    }
+                    break;
+                case 'set_pose':
+                    if (Array.isArray(cmd.angles) && cmd.angles.length === 6) {
+                        cmd.angles.forEach((angle, i) => {
+                            jointTargets[i] = angle;
+                            updateSliderUI(i, angle);
+                        });
                     }
                     break;
                 case 'set_magnet':
@@ -953,10 +886,18 @@
                     break;
                 case 'reset_arm':
                     jointTargets = [0, 0, 0, 0, 0, 0];
+                    jointTargets.forEach((angle, i) => updateSliderUI(i, angle));
                     magnetOn = false;
                     updateMagnetUI();
                     break;
             }
+        }
+
+        function updateSliderUI(joint, angle) {
+            const slider = document.getElementById(`joint-${joint}`);
+            const valueEl = document.getElementById(`joint-${joint}-value`);
+            if (slider) slider.value = angle;
+            if (valueEl) valueEl.textContent = `${Math.round(angle)}°`;
         }
 
         function updateMagnetUI() {
@@ -1007,57 +948,6 @@
                 }
             });
         };
-
-        window.testMoveJoint = async function() {
-            const joint = parseInt(document.getElementById('mcp-joint').value);
-            const angle = parseFloat(document.getElementById('mcp-angle').value);
-            jointTargets[joint] = angle;
-            await sendCommand('move_joint', { joint, angle });
-            logStatus(`move_joint(${joint}, ${angle})`);
-        };
-
-        window.testMagnetOn = async function() {
-            magnetOn = true;
-            updateMagnetUI();
-            await sendCommand('set_magnet', { enabled: true });
-            logStatus('set_magnet(true)');
-        };
-
-        window.testMagnetOff = async function() {
-            magnetOn = false;
-            updateMagnetUI();
-            await sendCommand('set_magnet', { enabled: false });
-            logStatus('set_magnet(false)');
-        };
-
-        window.testGetState = function() {
-            const state = {
-                jointAngles: jointAngles.map(a => Math.round(a)),
-                magnetOn,
-                endEffector: magnetBall ? {
-                    x: magnetBall.position.x.toFixed(3),
-                    y: magnetBall.position.y.toFixed(3),
-                    z: magnetBall.position.z.toFixed(3)
-                } : null
-            };
-            logStatus(JSON.stringify(state, null, 2));
-        };
-
-        function logStatus(msg) {
-            const status = document.getElementById('status');
-            const time = new Date().toLocaleTimeString();
-            status.innerHTML = `[${time}] ${msg}\n` + status.innerHTML;
-        }
-
-        // Tab switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                tab.classList.add('active');
-                document.getElementById(`${tab.dataset.tab}-tab`).classList.add('active');
-            });
-        });
 
         // Start
         init().catch(console.error);
