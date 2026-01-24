@@ -212,6 +212,39 @@
         let attachedObject = null;
         let magnetConstraint = null;
 
+        // Motion completion tracking
+        let lastMotionComplete = true;
+        const MOTION_TOLERANCE = 1.0; // degrees
+
+        function checkMotionComplete() {
+            for (let i = 0; i < 6; i++) {
+                if (Math.abs(jointTargets[i] - jointAngles[i]) > MOTION_TOLERANCE) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function reportMotionStatus() {
+            const complete = checkMotionComplete();
+            if (complete !== lastMotionComplete) {
+                lastMotionComplete = complete;
+                fetch(`${API_BASE}/api/motion-status`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ complete, jointAngles: [...jointAngles] })
+                }).catch(() => {});
+            }
+        }
+
+        function reportAttachmentStatus(objectId, attached) {
+            fetch(`${API_BASE}/api/attachment-status`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ objectId, attached })
+            }).catch(() => {});
+        }
+
         // Three.js objects
         let scene, camera, renderer, controls;
         const armSegments = [];
@@ -702,20 +735,27 @@
                         // If very close, snap and attach
                         if (dist < 0.08) {
                             mesh.userData.attached = true;
+                            attachedObject = id;
                             // Immediately set position to prevent physics instability
                             const snapY = Math.max(magnetPos.y - 0.06, config.size * 0.5 + 0.01);
                             body.setTranslation({ x: magnetPos.x, y: snapY, z: magnetPos.z }, true);
                             body.setLinvel({ x: 0, y: 0, z: 0 }, true);
                             body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                            // Report attachment to server
+                            reportAttachmentStatus(id, true);
                         }
                     }
                 } else if (mesh.userData.attached) {
                     // Magnet turned off - release object, let it fall straight down
                     mesh.userData.attached = false;
+                    const releasedId = attachedObject;
+                    attachedObject = null;
                     // Zero out velocity and let gravity take over
                     body.setLinvel({ x: 0, y: 0, z: 0 }, true);
                     body.setAngvel({ x: 0, y: 0, z: 0 }, true);
                     body.wakeUp();
+                    // Report detachment to server
+                    reportAttachmentStatus(releasedId || id, false);
                 }
             });
         }
@@ -777,6 +817,9 @@
                 `(${endEffectorPos.x.toFixed(2)}, ${endEffectorPos.y.toFixed(2)}, ${endEffectorPos.z.toFixed(2)})`;
 
             updateObjectList();
+
+            // Report motion status to server for task coordination
+            reportMotionStatus();
 
             // Periodically save object positions
             if (now - lastSaveTime > SAVE_INTERVAL) {
