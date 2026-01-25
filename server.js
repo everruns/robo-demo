@@ -22,10 +22,11 @@ const STATE_FILE = join(__dirname, 'state.json');
 const defaultState = {
     jointTargets: [0, 0, 0, 0, 0, 0],
     magnetOn: false,
+    attachedObject: null,
     objects: [
-        { id: 'cube1', position: { x: 0.4, y: 0.025, z: 0.3 } },
-        { id: 'cube2', position: { x: -0.3, y: 0.025, z: 0.4 } },
-        { id: 'cylinder1', position: { x: 0.25, y: 0.03, z: -0.35 } }
+        { id: 'cube1', type: 'cube', position: { x: 0.4, y: 0.025, z: 0.3 }, size: 0.05, color: 'silver' },
+        { id: 'cube2', type: 'cube', position: { x: -0.3, y: 0.025, z: 0.4 }, size: 0.04, color: 'gray' },
+        { id: 'cylinder1', type: 'cylinder', position: { x: 0.25, y: 0.03, z: -0.35 }, size: 0.03, color: 'silver' }
     ]
 };
 
@@ -62,63 +63,345 @@ const jointLimits = [
 ];
 
 // ============================================================================
+// INVERSE KINEMATICS SOLVER
+// ============================================================================
+
+// Arm configuration (matches index.html)
+const ARM_CONFIG = {
+    baseHeight: 0.1,
+    L1: 0.35,  // shoulder to elbow (segment 1)
+    L2: 0.30,  // elbow to wrist (segment 2)
+    L3: 0.35,  // wrist to end effector (0.15 + 0.12 + 0.08)
+    reachRadius: 0.80,
+    maxHeight: 0.95,
+    minHeight: 0.05
+};
+
+function solveIK(targetPos, targetOrientation = 'vertical') {
+    const { baseHeight, L1, L2, L3 } = ARM_CONFIG;
+
+    // 1. Base rotation (joint 0) - rotate to face target in XZ plane
+    const theta0 = Math.atan2(targetPos.x, targetPos.z);
+
+    // 2. Project to 2D plane for arm reach
+    const r = Math.sqrt(targetPos.x ** 2 + targetPos.z ** 2);
+    const h = targetPos.y - baseHeight - L3; // Height for wrist position
+
+    // 3. Two-link planar IK for joints 1,2
+    const d = Math.sqrt(r ** 2 + h ** 2);
+    if (d > L1 + L2 - 0.01) {
+        return null; // Unreachable - too far
+    }
+    if (d < Math.abs(L1 - L2) + 0.01) {
+        return null; // Unreachable - too close
+    }
+
+    // Law of cosines for elbow angle
+    const cos_theta2 = (d ** 2 - L1 ** 2 - L2 ** 2) / (2 * L1 * L2);
+    const clampedCos = Math.max(-1, Math.min(1, cos_theta2));
+    const theta2 = -Math.acos(clampedCos); // Elbow up configuration
+
+    // Angle to target and arm geometry
+    const alpha = Math.atan2(h, r);
+    const cos_beta = (L1 ** 2 + d ** 2 - L2 ** 2) / (2 * L1 * d);
+    const clampedCosBeta = Math.max(-1, Math.min(1, cos_beta));
+    const beta = Math.acos(clampedCosBeta);
+    const theta1 = alpha + beta - Math.PI / 2;
+
+    // 4. Wrist joints to keep end effector vertical
+    const theta3 = 0; // Roll
+    const theta4 = -(theta1 + theta2); // Pitch compensation
+    const theta5 = -theta0; // Counter-rotate base rotation
+
+    // Convert to degrees and clamp to joint limits
+    const angles = [theta0, theta1, theta2, theta3, theta4, theta5].map((rad, i) => {
+        const deg = rad * 180 / Math.PI;
+        return Math.max(jointLimits[i][0], Math.min(jointLimits[i][1], deg));
+    });
+
+    return angles;
+}
+
+// ============================================================================
+// TASK EXECUTION STATE
+// ============================================================================
+
+let currentTask = null;
+let motionComplete = true;
+let motionCompleteResolve = null;
+let attachmentResolve = null;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForMotionComplete(timeoutMs = 10000) {
+    if (motionComplete) return true;
+
+    return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+            motionCompleteResolve = null;
+            resolve(false);
+        }, timeoutMs);
+
+        motionCompleteResolve = () => {
+            clearTimeout(timeout);
+            motionCompleteResolve = null;
+            resolve(true);
+        };
+    });
+}
+
+async function waitForAttachment(objectId, timeoutMs = 3000) {
+    return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+            attachmentResolve = null;
+            resolve(false);
+        }, timeoutMs);
+
+        attachmentResolve = (attachedId) => {
+            clearTimeout(timeout);
+            attachmentResolve = null;
+            resolve(attachedId === objectId);
+        };
+    });
+}
+
+async function moveTo(position) {
+    const angles = solveIK(position);
+    if (!angles) {
+        throw new Error('OUT_OF_REACH');
+    }
+
+    motionComplete = false;
+    armState.jointTargets = angles;
+    saveState();
+    broadcastCommand({ type: 'set_pose', angles });
+
+    await waitForMotionComplete();
+    await sleep(100); // Small delay for stability
+}
+
+async function setMagnet(enabled) {
+    armState.magnetOn = enabled;
+    saveState();
+    broadcastCommand({ type: 'set_magnet', enabled });
+    await sleep(100);
+}
+
+// ============================================================================
+// TASK EXECUTION FUNCTIONS
+// ============================================================================
+
+async function executePickObject(objectId) {
+    const startTime = Date.now();
+
+    // 1. Find object
+    const obj = armState.objects.find(o => o.id === objectId);
+    if (!obj) {
+        return {
+            success: false,
+            message: `Object '${objectId}' not found`,
+            error_code: 'OBJECT_NOT_FOUND',
+            duration_ms: Date.now() - startTime
+        };
+    }
+
+    // 2. Check if already holding something
+    if (armState.magnetOn && armState.attachedObject) {
+        return {
+            success: false,
+            message: `Already holding object '${armState.attachedObject}'`,
+            error_code: 'ALREADY_HOLDING_OBJECT',
+            duration_ms: Date.now() - startTime
+        };
+    }
+
+    try {
+        // 3. Compute positions
+        const abovePos = { x: obj.position.x, y: 0.30, z: obj.position.z };
+        const pickPos = { x: obj.position.x, y: obj.position.y + 0.12, z: obj.position.z };
+        const liftPos = { x: obj.position.x, y: 0.35, z: obj.position.z };
+
+        // 4. Execute sequence
+        await moveTo(abovePos);
+        await moveTo(pickPos);
+        await setMagnet(true);
+
+        // Wait for attachment
+        const attached = await waitForAttachment(objectId, 2000);
+        if (!attached) {
+            // Try again - refresh object position from state
+            await sleep(500);
+        }
+
+        await moveTo(liftPos);
+
+        armState.attachedObject = objectId;
+        saveState();
+
+        return {
+            success: true,
+            message: `Successfully picked up '${objectId}'`,
+            error_code: null,
+            duration_ms: Date.now() - startTime
+        };
+    } catch (error) {
+        return {
+            success: false,
+            message: error.message,
+            error_code: error.message,
+            duration_ms: Date.now() - startTime
+        };
+    }
+}
+
+async function executeCarryTo(x, y, z) {
+    const startTime = Date.now();
+
+    // Check if holding an object
+    if (!armState.magnetOn || !armState.attachedObject) {
+        return {
+            success: false,
+            message: 'Not holding any object',
+            error_code: 'NO_OBJECT_HELD',
+            duration_ms: Date.now() - startTime
+        };
+    }
+
+    try {
+        const targetPos = { x, y, z };
+        await moveTo(targetPos);
+
+        return {
+            success: true,
+            message: `Carried object to (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`,
+            error_code: null,
+            duration_ms: Date.now() - startTime
+        };
+    } catch (error) {
+        return {
+            success: false,
+            message: error.message,
+            error_code: error.message,
+            duration_ms: Date.now() - startTime
+        };
+    }
+}
+
+async function executePlaceObject(params = {}) {
+    const startTime = Date.now();
+
+    // Check if holding an object
+    if (!armState.magnetOn || !armState.attachedObject) {
+        return {
+            success: false,
+            message: 'Not holding any object',
+            error_code: 'NO_OBJECT_HELD',
+            duration_ms: Date.now() - startTime
+        };
+    }
+
+    const objectId = armState.attachedObject;
+
+    try {
+        // If position specified, move there first
+        if (params.x !== undefined && params.y !== undefined && params.z !== undefined) {
+            await moveTo({ x: params.x, y: params.y, z: params.z });
+        }
+
+        // Release the object
+        await setMagnet(false);
+        await sleep(500); // Let object fall
+
+        armState.attachedObject = null;
+        saveState();
+
+        return {
+            success: true,
+            message: `Placed object '${objectId}'`,
+            error_code: null,
+            duration_ms: Date.now() - startTime
+        };
+    } catch (error) {
+        return {
+            success: false,
+            message: error.message,
+            error_code: error.message,
+            duration_ms: Date.now() - startTime
+        };
+    }
+}
+
+async function executeDance(durationSeconds) {
+    const startTime = Date.now();
+
+    const danceFrames = [
+        [0, 0, 0, 0, 0, 0],           // Home
+        [45, 20, -30, 0, 10, 90],     // Wave right
+        [-45, 20, -30, 0, 10, -90],   // Wave left
+        [0, 45, -90, 45, 30, 0],      // Reach up
+        [0, -10, 30, 0, -20, 180],    // Bow
+        [90, 30, -60, 90, 0, 45],     // Pose 1
+        [-90, 30, -60, -90, 0, -45],  // Pose 2
+        [0, 0, 0, 0, 0, 0],           // Home
+    ];
+
+    const frameTime = (durationSeconds * 1000) / danceFrames.length;
+
+    for (const frame of danceFrames) {
+        motionComplete = false;
+        armState.jointTargets = frame;
+        saveState();
+        broadcastCommand({ type: 'set_pose', angles: frame });
+
+        await sleep(frameTime);
+        await waitForMotionComplete(5000);
+    }
+
+    return {
+        success: true,
+        message: `Dance completed (${durationSeconds}s)`,
+        error_code: null,
+        duration_ms: Date.now() - startTime
+    };
+}
+
+async function executeResetToBase() {
+    const startTime = Date.now();
+
+    // Turn off magnet if on
+    if (armState.magnetOn) {
+        await setMagnet(false);
+        armState.attachedObject = null;
+    }
+
+    // Reset to home position
+    const homeAngles = [0, 0, 0, 0, 0, 0];
+    motionComplete = false;
+    armState.jointTargets = homeAngles;
+    saveState();
+    broadcastCommand({ type: 'set_pose', angles: homeAngles });
+
+    await waitForMotionComplete();
+
+    return {
+        success: true,
+        message: 'Arm reset to home position',
+        error_code: null,
+        duration_ms: Date.now() - startTime
+    };
+}
+
+// ============================================================================
 // MCP TOOL DEFINITIONS
 // ============================================================================
 
 const mcpTools = [
-    {
-        name: 'move_joint',
-        description: 'Move a specific joint to an angle. Joint indices: 0=base, 1=shoulder, 2=elbow, 3=wrist roll, 4=wrist pitch, 5=wrist rotation',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                joint: { type: 'integer', minimum: 0, maximum: 5, description: 'Joint index (0-5)' },
-                angle: { type: 'number', description: 'Target angle in degrees' }
-            },
-            required: ['joint', 'angle']
-        }
-    },
-    {
-        name: 'set_magnet',
-        description: 'Turn the magnetic end effector on or off. When on, attracts nearby metallic objects.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                enabled: { type: 'boolean', description: 'true = magnet on, false = magnet off' }
-            },
-            required: ['enabled']
-        }
-    },
-    {
-        name: 'get_arm_state',
-        description: 'Get current arm state (joint targets and magnet status).',
-        inputSchema: { type: 'object', properties: {} }
-    },
-    {
-        name: 'reset_arm',
-        description: 'Reset arm to home position (all joints 0°, magnet off).',
-        inputSchema: { type: 'object', properties: {} }
-    },
-    {
-        name: 'set_pose',
-        description: 'Set all 6 joint angles at once.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                angles: {
-                    type: 'array',
-                    items: { type: 'number' },
-                    minItems: 6,
-                    maxItems: 6,
-                    description: 'Array of 6 angles in degrees'
-                }
-            },
-            required: ['angles']
-        }
-    },
+    // Discovery Tools
     {
         name: 'take_screenshot',
-        description: 'Capture a screenshot of the current 3D scene.',
+        description: 'Capture a screenshot of the current 3D scene. Returns a base64 PNG image.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -126,87 +409,149 @@ const mcpTools = [
                 height: { type: 'integer', description: 'Height in pixels (default: 600)', minimum: 100, maximum: 1080 }
             }
         }
+    },
+    {
+        name: 'discover_objects',
+        description: 'List all metallic objects in the scene that can be picked up by the magnetic gripper.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    {
+        name: 'get_environment_info',
+        description: 'Get information about the robot arm, workspace bounds, and coordinate system.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    // Task Execution Tools
+    {
+        name: 'pick_object',
+        description: 'Move the arm to the specified object and pick it up with the magnetic gripper. The arm will move above the object, descend, activate the magnet, and lift.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                object_id: { type: 'string', description: 'ID of the object to pick (from discover_objects)' }
+            },
+            required: ['object_id']
+        }
+    },
+    {
+        name: 'carry_to',
+        description: 'Move the currently held object to a specified position. Must be holding an object first (use pick_object).',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x: { type: 'number', description: 'X coordinate (right is positive)' },
+                y: { type: 'number', description: 'Y coordinate (up is positive, should be > 0.1 to stay above ground)' },
+                z: { type: 'number', description: 'Z coordinate (forward is positive)' }
+            },
+            required: ['x', 'y', 'z']
+        }
+    },
+    {
+        name: 'place_object',
+        description: 'Release the currently held object. Optionally move to a position first. The object will fall due to gravity.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x: { type: 'number', description: 'Optional X coordinate to move to before placing' },
+                y: { type: 'number', description: 'Optional Y coordinate to move to before placing' },
+                z: { type: 'number', description: 'Optional Z coordinate to move to before placing' }
+            }
+        }
+    },
+    {
+        name: 'dance',
+        description: 'Make the robot arm perform a fun dance animation.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                duration_seconds: { type: 'number', description: 'Duration of the dance in seconds (default: 5)', minimum: 1, maximum: 30 }
+            }
+        }
+    },
+    {
+        name: 'reset_to_base',
+        description: 'Return the arm to its home position (all joints at 0 degrees) and release any held object.',
+        inputSchema: { type: 'object', properties: {} }
     }
 ];
 
 function executeTool(name, args) {
     switch (name) {
-        case 'move_joint': {
-            const { joint, angle } = args;
-            if (joint < 0 || joint > 5) {
-                return { success: false, error: 'Joint must be 0-5' };
-            }
-            const limits = jointLimits[joint];
-            const clampedAngle = Math.max(limits[0], Math.min(limits[1], angle));
-            armState.jointTargets[joint] = clampedAngle;
-            saveState();
-
-            // Send command to browser
-            broadcastCommand({ type: 'move_joint', joint, angle: clampedAngle });
-
+        case 'discover_objects':
             return {
-                success: true,
-                message: `Joint ${joint} moving to ${clampedAngle}°`,
-                jointTargets: [...armState.jointTargets]
-            };
-        }
-
-        case 'set_magnet': {
-            armState.magnetOn = !!args.enabled;
-            saveState();
-            broadcastCommand({ type: 'set_magnet', enabled: armState.magnetOn });
-            return {
-                success: true,
-                message: `Magnet ${armState.magnetOn ? 'ON' : 'OFF'}`,
-                magnetOn: armState.magnetOn
-            };
-        }
-
-        case 'get_arm_state':
-            return {
-                success: true,
-                state: {
-                    jointTargets: [...armState.jointTargets],
-                    magnetOn: armState.magnetOn,
-                    objects: armState.objects,
-                    jointLimits
-                }
+                objects: armState.objects.map(obj => ({
+                    id: obj.id,
+                    type: obj.type || 'cube',
+                    position: { ...obj.position },
+                    size: obj.size || 0.05,
+                    color: obj.color || 'silver',
+                    attached: armState.attachedObject === obj.id
+                }))
             };
 
-        case 'reset_arm':
-            armState.jointTargets = [0, 0, 0, 0, 0, 0];
-            armState.magnetOn = false;
-            saveState();
-            broadcastCommand({ type: 'reset_arm' });
+        case 'get_environment_info':
             return {
-                success: true,
-                message: 'Arm reset to home position',
-                jointTargets: [...armState.jointTargets]
+                coordinate_system: {
+                    type: 'right-handed',
+                    units: 'meters',
+                    origin: 'base of robot arm',
+                    x_axis: 'right (positive)',
+                    y_axis: 'up (positive)',
+                    z_axis: 'forward (positive)'
+                },
+                arm: {
+                    type: '6-DOF serial manipulator',
+                    reach_radius: ARM_CONFIG.reachRadius,
+                    max_height: ARM_CONFIG.maxHeight,
+                    min_height: ARM_CONFIG.minHeight,
+                    end_effector: 'electromagnetic magnet (radius 0.05m)',
+                    joint_limits: jointLimits.map((limits, i) => ({
+                        joint: i,
+                        min: limits[0],
+                        max: limits[1],
+                        unit: 'degrees'
+                    }))
+                },
+                workspace: {
+                    floor_height: 0,
+                    bounds: { x: [-0.8, 0.8], y: [0.05, 0.95], z: [-0.8, 0.8] }
+                },
+                current_state: {
+                    holding_object: armState.attachedObject,
+                    magnet_on: armState.magnetOn
+                },
+                hint: 'Use discover_objects to get current object positions'
             };
-
-        case 'set_pose': {
-            const { angles } = args;
-            if (!Array.isArray(angles) || angles.length !== 6) {
-                return { success: false, error: 'Must provide array of 6 angles' };
-            }
-            angles.forEach((angle, i) => {
-                const limits = jointLimits[i];
-                armState.jointTargets[i] = Math.max(limits[0], Math.min(limits[1], angle));
-            });
-            saveState();
-            broadcastCommand({ type: 'set_pose', angles: armState.jointTargets });
-            return {
-                success: true,
-                message: 'Moving to pose',
-                jointTargets: [...armState.jointTargets]
-            };
-        }
 
         case 'take_screenshot':
             return 'SCREENSHOT_REQUEST';
 
+        // Async task tools return promises
+        case 'pick_object':
+        case 'carry_to':
+        case 'place_object':
+        case 'dance':
+        case 'reset_to_base':
+            return 'ASYNC_TASK';
+
         default:
             return { success: false, error: `Unknown tool: ${name}` };
+    }
+}
+
+async function executeAsyncTool(name, args) {
+    switch (name) {
+        case 'pick_object':
+            return await executePickObject(args.object_id);
+        case 'carry_to':
+            return await executeCarryTo(args.x, args.y, args.z);
+        case 'place_object':
+            return await executePlaceObject(args);
+        case 'dance':
+            return await executeDance(args.duration_seconds || 5);
+        case 'reset_to_base':
+            return await executeResetToBase();
+        default:
+            return { success: false, error: `Unknown async tool: ${name}` };
     }
 }
 
@@ -374,6 +719,29 @@ async function handleMcpMessage(message, session) {
             }
 
             const result = executeTool(name, args || {});
+
+            // Handle async task tools
+            if (result === 'ASYNC_TASK') {
+                try {
+                    const asyncResult = await executeAsyncTool(name, args || {});
+                    return {
+                        jsonrpc: '2.0',
+                        id,
+                        result: {
+                            content: [{ type: 'text', text: JSON.stringify(asyncResult, null, 2) }]
+                        }
+                    };
+                } catch (error) {
+                    return {
+                        jsonrpc: '2.0',
+                        id,
+                        result: {
+                            content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message }) }]
+                        }
+                    };
+                }
+            }
+
             return {
                 jsonrpc: '2.0',
                 id,
@@ -421,9 +789,44 @@ app.get('/api/state', (req, res) => {
 app.post('/api/objects', (req, res) => {
     const { objects } = req.body;
     if (Array.isArray(objects)) {
-        armState.objects = objects;
+        // Merge position updates while preserving type/size/color info
+        objects.forEach(update => {
+            const existing = armState.objects.find(o => o.id === update.id);
+            if (existing) {
+                existing.position = update.position;
+            }
+        });
         saveState();
     }
+    res.json({ success: true });
+});
+
+// Motion status reporting from browser
+app.post('/api/motion-status', (req, res) => {
+    const { complete, jointAngles } = req.body;
+    motionComplete = complete;
+
+    if (complete && motionCompleteResolve) {
+        motionCompleteResolve();
+    }
+
+    res.json({ success: true });
+});
+
+// Attachment status reporting from browser
+app.post('/api/attachment-status', (req, res) => {
+    const { objectId, attached } = req.body;
+
+    if (attached) {
+        armState.attachedObject = objectId;
+        if (attachmentResolve) {
+            attachmentResolve(objectId);
+        }
+    } else if (armState.attachedObject === objectId) {
+        armState.attachedObject = null;
+    }
+
+    saveState();
     res.json({ success: true });
 });
 
