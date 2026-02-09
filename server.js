@@ -17,7 +17,10 @@ app.use(express.static(join(__dirname, 'public')));
 // STATE PERSISTENCE
 // ============================================================================
 
-const STATE_FILE = join(__dirname, 'state.json');
+// Use /tmp in serverless (Vercel) since source dir is read-only
+const STATE_FILE = process.env.VERCEL
+    ? '/tmp/state.json'
+    : join(__dirname, 'state.json');
 
 const defaultState = {
     jointTargets: [0, 0, 0, 0, 0, 0],
