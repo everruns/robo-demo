@@ -326,8 +326,8 @@
             createJointControls();
             setupMouseDragging();
 
-            // Connect to server (polling for Vercel compatibility)
-            startPolling();
+            // Connect to server
+            connectSSE();
 
             // Start animation loop
             animate();
@@ -865,7 +865,6 @@
 
                 const slider = div.querySelector('input');
                 slider.addEventListener('input', (e) => {
-                    markUserControl();
                     const angle = parseFloat(e.target.value);
                     jointTargets[i] = angle;
                     sendCommand('move_joint', { joint: i, angle });
@@ -886,60 +885,55 @@
             }
         }
 
-        // Polling-based server sync (works with Vercel serverless)
-        let pollingActive = false;
-        let userIsControlling = false;
-        let userControlTimeout = null;
+        function connectSSE() {
+            const eventSource = new EventSource(`${API_BASE}/api/events`);
 
-        // Track when user is actively moving sliders to avoid server overwrite
-        function markUserControl() {
-            userIsControlling = true;
-            clearTimeout(userControlTimeout);
-            userControlTimeout = setTimeout(() => { userIsControlling = false; }, 2000);
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'connected') {
+                    document.getElementById('mcp-connected').textContent = 'Connected';
+                    document.getElementById('mcp-connected').style.color = '#2ecc71';
+                }
+                if (data.command) {
+                    handleServerCommand(data.command);
+                }
+            };
+
+            eventSource.onerror = () => {
+                document.getElementById('mcp-connected').textContent = 'Reconnecting...';
+                document.getElementById('mcp-connected').style.color = '#f39c12';
+                eventSource.close();
+                setTimeout(connectSSE, 2000);
+            };
         }
 
-        function startPolling() {
-            if (pollingActive) return;
-            pollingActive = true;
-
-            document.getElementById('mcp-connected').textContent = 'Connected';
-            document.getElementById('mcp-connected').style.color = '#2ecc71';
-
-            setInterval(async () => {
-                try {
-                    const res = await fetch(`${API_BASE}/api/state`);
-                    if (!res.ok) return;
-                    const state = await res.json();
-
-                    // Skip state sync while user is actively controlling
-                    if (userIsControlling) return;
-
-                    // Apply joint target changes from server (MCP commands)
-                    if (state.jointTargets) {
-                        let changed = false;
-                        for (let i = 0; i < 6; i++) {
-                            if (Math.abs(state.jointTargets[i] - jointTargets[i]) > 0.5) {
-                                changed = true;
-                                break;
-                            }
-                        }
-                        if (changed) {
-                            state.jointTargets.forEach((angle, i) => {
-                                jointTargets[i] = angle;
-                                updateSliderUI(i, angle);
-                            });
-                        }
+        function handleServerCommand(cmd) {
+            switch (cmd.type) {
+                case 'move_joint':
+                    if (cmd.joint >= 0 && cmd.joint < 6) {
+                        jointTargets[cmd.joint] = cmd.angle;
+                        updateSliderUI(cmd.joint, cmd.angle);
                     }
-
-                    // Apply magnet state changes from server
-                    if (state.magnetOn !== undefined && state.magnetOn !== magnetOn) {
-                        magnetOn = state.magnetOn;
-                        updateMagnetUI();
+                    break;
+                case 'set_pose':
+                    if (Array.isArray(cmd.angles) && cmd.angles.length === 6) {
+                        cmd.angles.forEach((angle, i) => {
+                            jointTargets[i] = angle;
+                            updateSliderUI(i, angle);
+                        });
                     }
-                } catch (e) {
-                    // Polling error - ignore, will retry next interval
-                }
-            }, 500);
+                    break;
+                case 'set_magnet':
+                    magnetOn = cmd.enabled;
+                    updateMagnetUI();
+                    break;
+                case 'reset_arm':
+                    jointTargets = [0, 0, 0, 0, 0, 0];
+                    jointTargets.forEach((angle, i) => updateSliderUI(i, angle));
+                    magnetOn = false;
+                    updateMagnetUI();
+                    break;
+            }
         }
 
         function updateSliderUI(joint, angle) {
@@ -971,14 +965,12 @@
 
         // Global functions for UI
         window.toggleMagnet = function() {
-            markUserControl();
             magnetOn = !magnetOn;
             updateMagnetUI();
             sendCommand('set_magnet', { enabled: magnetOn });
         };
 
         window.resetArm = function() {
-            markUserControl();
             jointTargets = [0, 0, 0, 0, 0, 0];
             magnetOn = false;
             updateMagnetUI();

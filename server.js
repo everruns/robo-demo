@@ -17,10 +17,7 @@ app.use(express.static(join(__dirname, 'public')));
 // STATE PERSISTENCE
 // ============================================================================
 
-// Use /tmp in serverless (Vercel) since source dir is read-only
-const STATE_FILE = process.env.VERCEL
-    ? '/tmp/state.json'
-    : join(__dirname, 'state.json');
+const STATE_FILE = join(__dirname, 'state.json');
 
 const defaultState = {
     jointTargets: [0, 0, 0, 0, 0, 0],
@@ -878,17 +875,11 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-// Only start server when running directly (not imported by Vercel)
-const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
-if (isMainModule) {
-    app.listen(PORT, () => {
-        console.log(`
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`
 🤖 Robo Demo Server v2.0
 
    Web UI:       http://localhost:${PORT}
    MCP Endpoint: http://localhost:${PORT}/mcp
 `);
-    });
-}
-
-export default app;
+});
