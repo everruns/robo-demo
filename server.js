@@ -874,11 +874,18 @@ app.get('/health', (req, res) => {
 // ============================================================================
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`
+
+// Only start server when running directly (not imported by Vercel)
+const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
+if (isMainModule) {
+    app.listen(PORT, () => {
+        console.log(`
 🤖 Robo Demo Server v2.0
 
    Web UI:       http://localhost:${PORT}
    MCP Endpoint: http://localhost:${PORT}/mcp
 `);
-});
+    });
+}
+
+export default app;
