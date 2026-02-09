@@ -30,7 +30,9 @@ const defaultState = {
         { id: 'cube1', type: 'cube', position: { x: 0.4, y: 0.025, z: 0.3 }, size: 0.05, color: 'silver' },
         { id: 'cube2', type: 'cube', position: { x: -0.3, y: 0.025, z: 0.4 }, size: 0.04, color: 'gray' },
         { id: 'cylinder1', type: 'cylinder', position: { x: 0.25, y: 0.03, z: -0.35 }, size: 0.03, color: 'silver' }
-    ]
+    ],
+    pendingCommand: null,
+    commandResult: null
 };
 
 function loadState() {
@@ -65,335 +67,19 @@ const jointLimits = [
     [-180, 180]   // Wrist rotation
 ];
 
-// ============================================================================
-// INVERSE KINEMATICS SOLVER
-// ============================================================================
-
-// Arm configuration (matches index.html)
+// Arm configuration (used by get_environment_info)
 const ARM_CONFIG = {
     baseHeight: 0.1,
-    L1: 0.35,  // shoulder to elbow (segment 1)
-    L2: 0.30,  // elbow to wrist (segment 2)
-    L3: 0.35,  // wrist to end effector (0.15 + 0.12 + 0.08)
+    L1: 0.35,
+    L2: 0.30,
+    L3: 0.35,
     reachRadius: 0.80,
     maxHeight: 0.95,
     minHeight: 0.05
 };
 
-function solveIK(targetPos, targetOrientation = 'vertical') {
-    const { baseHeight, L1, L2, L3 } = ARM_CONFIG;
-
-    // 1. Base rotation (joint 0) - rotate to face target in XZ plane
-    const theta0 = Math.atan2(targetPos.x, targetPos.z);
-
-    // 2. Project to 2D plane for arm reach
-    const r = Math.sqrt(targetPos.x ** 2 + targetPos.z ** 2);
-    const h = targetPos.y - baseHeight - L3; // Height for wrist position
-
-    // 3. Two-link planar IK for joints 1,2
-    const d = Math.sqrt(r ** 2 + h ** 2);
-    if (d > L1 + L2 - 0.01) {
-        return null; // Unreachable - too far
-    }
-    if (d < Math.abs(L1 - L2) + 0.01) {
-        return null; // Unreachable - too close
-    }
-
-    // Law of cosines for elbow angle
-    const cos_theta2 = (d ** 2 - L1 ** 2 - L2 ** 2) / (2 * L1 * L2);
-    const clampedCos = Math.max(-1, Math.min(1, cos_theta2));
-    const theta2 = -Math.acos(clampedCos); // Elbow up configuration
-
-    // Angle to target and arm geometry
-    const alpha = Math.atan2(h, r);
-    const cos_beta = (L1 ** 2 + d ** 2 - L2 ** 2) / (2 * L1 * d);
-    const clampedCosBeta = Math.max(-1, Math.min(1, cos_beta));
-    const beta = Math.acos(clampedCosBeta);
-    const theta1 = alpha + beta - Math.PI / 2;
-
-    // 4. Wrist joints to keep end effector vertical
-    const theta3 = 0; // Roll
-    const theta4 = -(theta1 + theta2); // Pitch compensation
-    const theta5 = -theta0; // Counter-rotate base rotation
-
-    // Convert to degrees and clamp to joint limits
-    const angles = [theta0, theta1, theta2, theta3, theta4, theta5].map((rad, i) => {
-        const deg = rad * 180 / Math.PI;
-        return Math.max(jointLimits[i][0], Math.min(jointLimits[i][1], deg));
-    });
-
-    return angles;
-}
-
-// ============================================================================
-// TASK EXECUTION STATE
-// ============================================================================
-
-let currentTask = null;
-let motionComplete = true;
-let motionCompleteResolve = null;
-let attachmentResolve = null;
-
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function waitForMotionComplete(timeoutMs = 10000) {
-    if (motionComplete) return true;
-
-    return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-            motionCompleteResolve = null;
-            resolve(false);
-        }, timeoutMs);
-
-        motionCompleteResolve = () => {
-            clearTimeout(timeout);
-            motionCompleteResolve = null;
-            resolve(true);
-        };
-    });
-}
-
-async function waitForAttachment(objectId, timeoutMs = 3000) {
-    return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-            attachmentResolve = null;
-            resolve(false);
-        }, timeoutMs);
-
-        attachmentResolve = (attachedId) => {
-            clearTimeout(timeout);
-            attachmentResolve = null;
-            resolve(attachedId === objectId);
-        };
-    });
-}
-
-async function moveTo(position) {
-    const angles = solveIK(position);
-    if (!angles) {
-        throw new Error('OUT_OF_REACH');
-    }
-
-    motionComplete = false;
-    armState.jointTargets = angles;
-    saveState();
-    broadcastCommand({ type: 'set_pose', angles });
-
-    await waitForMotionComplete();
-    await sleep(100); // Small delay for stability
-}
-
-async function setMagnet(enabled) {
-    armState.magnetOn = enabled;
-    saveState();
-    broadcastCommand({ type: 'set_magnet', enabled });
-    await sleep(100);
-}
-
-// ============================================================================
-// TASK EXECUTION FUNCTIONS
-// ============================================================================
-
-async function executePickObject(objectId) {
-    const startTime = Date.now();
-
-    // 1. Find object
-    const obj = armState.objects.find(o => o.id === objectId);
-    if (!obj) {
-        return {
-            success: false,
-            message: `Object '${objectId}' not found`,
-            error_code: 'OBJECT_NOT_FOUND',
-            duration_ms: Date.now() - startTime
-        };
-    }
-
-    // 2. Check if already holding something
-    if (armState.magnetOn && armState.attachedObject) {
-        return {
-            success: false,
-            message: `Already holding object '${armState.attachedObject}'`,
-            error_code: 'ALREADY_HOLDING_OBJECT',
-            duration_ms: Date.now() - startTime
-        };
-    }
-
-    try {
-        // 3. Compute positions
-        const abovePos = { x: obj.position.x, y: 0.30, z: obj.position.z };
-        const pickPos = { x: obj.position.x, y: obj.position.y + 0.12, z: obj.position.z };
-        const liftPos = { x: obj.position.x, y: 0.35, z: obj.position.z };
-
-        // 4. Execute sequence
-        await moveTo(abovePos);
-        await moveTo(pickPos);
-        await setMagnet(true);
-
-        // Wait for attachment
-        const attached = await waitForAttachment(objectId, 2000);
-        if (!attached) {
-            // Try again - refresh object position from state
-            await sleep(500);
-        }
-
-        await moveTo(liftPos);
-
-        armState.attachedObject = objectId;
-        saveState();
-
-        return {
-            success: true,
-            message: `Successfully picked up '${objectId}'`,
-            error_code: null,
-            duration_ms: Date.now() - startTime
-        };
-    } catch (error) {
-        return {
-            success: false,
-            message: error.message,
-            error_code: error.message,
-            duration_ms: Date.now() - startTime
-        };
-    }
-}
-
-async function executeCarryTo(x, y, z) {
-    const startTime = Date.now();
-
-    // Check if holding an object
-    if (!armState.magnetOn || !armState.attachedObject) {
-        return {
-            success: false,
-            message: 'Not holding any object',
-            error_code: 'NO_OBJECT_HELD',
-            duration_ms: Date.now() - startTime
-        };
-    }
-
-    try {
-        const targetPos = { x, y, z };
-        await moveTo(targetPos);
-
-        return {
-            success: true,
-            message: `Carried object to (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`,
-            error_code: null,
-            duration_ms: Date.now() - startTime
-        };
-    } catch (error) {
-        return {
-            success: false,
-            message: error.message,
-            error_code: error.message,
-            duration_ms: Date.now() - startTime
-        };
-    }
-}
-
-async function executePlaceObject(params = {}) {
-    const startTime = Date.now();
-
-    // Check if holding an object
-    if (!armState.magnetOn || !armState.attachedObject) {
-        return {
-            success: false,
-            message: 'Not holding any object',
-            error_code: 'NO_OBJECT_HELD',
-            duration_ms: Date.now() - startTime
-        };
-    }
-
-    const objectId = armState.attachedObject;
-
-    try {
-        // If position specified, move there first
-        if (params.x !== undefined && params.y !== undefined && params.z !== undefined) {
-            await moveTo({ x: params.x, y: params.y, z: params.z });
-        }
-
-        // Release the object
-        await setMagnet(false);
-        await sleep(500); // Let object fall
-
-        armState.attachedObject = null;
-        saveState();
-
-        return {
-            success: true,
-            message: `Placed object '${objectId}'`,
-            error_code: null,
-            duration_ms: Date.now() - startTime
-        };
-    } catch (error) {
-        return {
-            success: false,
-            message: error.message,
-            error_code: error.message,
-            duration_ms: Date.now() - startTime
-        };
-    }
-}
-
-async function executeDance(durationSeconds) {
-    const startTime = Date.now();
-
-    const danceFrames = [
-        [0, 0, 0, 0, 0, 0],           // Home
-        [45, 20, -30, 0, 10, 90],     // Wave right
-        [-45, 20, -30, 0, 10, -90],   // Wave left
-        [0, 45, -90, 45, 30, 0],      // Reach up
-        [0, -10, 30, 0, -20, 180],    // Bow
-        [90, 30, -60, 90, 0, 45],     // Pose 1
-        [-90, 30, -60, -90, 0, -45],  // Pose 2
-        [0, 0, 0, 0, 0, 0],           // Home
-    ];
-
-    const frameTime = (durationSeconds * 1000) / danceFrames.length;
-
-    for (const frame of danceFrames) {
-        motionComplete = false;
-        armState.jointTargets = frame;
-        saveState();
-        broadcastCommand({ type: 'set_pose', angles: frame });
-
-        await sleep(frameTime);
-        await waitForMotionComplete(5000);
-    }
-
-    return {
-        success: true,
-        message: `Dance completed (${durationSeconds}s)`,
-        error_code: null,
-        duration_ms: Date.now() - startTime
-    };
-}
-
-async function executeResetToBase() {
-    const startTime = Date.now();
-
-    // Turn off magnet if on
-    if (armState.magnetOn) {
-        await setMagnet(false);
-        armState.attachedObject = null;
-    }
-
-    // Reset to home position
-    const homeAngles = [0, 0, 0, 0, 0, 0];
-    motionComplete = false;
-    armState.jointTargets = homeAngles;
-    saveState();
-    broadcastCommand({ type: 'set_pose', angles: homeAngles });
-
-    await waitForMotionComplete();
-
-    return {
-        success: true,
-        message: 'Arm reset to home position',
-        error_code: null,
-        duration_ms: Date.now() - startTime
-    };
 }
 
 // ============================================================================
@@ -477,7 +163,8 @@ const mcpTools = [
     }
 ];
 
-function executeTool(name, args) {
+// Sync tools return data directly from server state
+function executeSyncTool(name, args) {
     switch (name) {
         case 'discover_objects':
             return {
@@ -525,88 +212,55 @@ function executeTool(name, args) {
                 hint: 'Use discover_objects to get current object positions'
             };
 
-        case 'take_screenshot':
-            return 'SCREENSHOT_REQUEST';
-
-        // Async task tools return promises
-        case 'pick_object':
-        case 'carry_to':
-        case 'place_object':
-        case 'dance':
-        case 'reset_to_base':
-            return 'ASYNC_TASK';
-
         default:
-            return { success: false, error: `Unknown tool: ${name}` };
+            return null;
     }
 }
 
-async function executeAsyncTool(name, args) {
-    switch (name) {
-        case 'pick_object':
-            return await executePickObject(args.object_id);
-        case 'carry_to':
-            return await executeCarryTo(args.x, args.y, args.z);
-        case 'place_object':
-            return await executePlaceObject(args);
-        case 'dance':
-            return await executeDance(args.duration_seconds || 5);
-        case 'reset_to_base':
-            return await executeResetToBase();
-        default:
-            return { success: false, error: `Unknown async tool: ${name}` };
+// Async tools are delegated to the browser via command queue
+const ASYNC_TOOLS = new Set([
+    'pick_object', 'carry_to', 'place_object', 'dance', 'reset_to_base', 'take_screenshot'
+]);
+
+async function executeViaCommandQueue(name, args, timeoutMs = 30000) {
+    const commandId = randomUUID();
+
+    // Write pending command for browser to pick up
+    armState.pendingCommand = {
+        id: commandId,
+        tool: name,
+        args: args || {},
+        timestamp: Date.now()
+    };
+    armState.commandResult = null;
+    saveState();
+
+    // Poll for result from browser
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+        await sleep(200);
+
+        if (armState.commandResult && armState.commandResult.commandId === commandId) {
+            const result = { ...armState.commandResult };
+            armState.pendingCommand = null;
+            armState.commandResult = null;
+            saveState();
+            return result;
+        }
     }
+
+    // Timeout
+    armState.pendingCommand = null;
+    saveState();
+    return { success: false, error: 'Command timeout - is a browser tab open?' };
 }
 
 // ============================================================================
-// CLIENT CONNECTIONS
+// CLIENT CONNECTIONS (SSE - kept for backward compat)
 // ============================================================================
 
 const uiClients = new Set();
 const mcpSessions = new Map();
-
-function broadcastCommand(command) {
-    const data = JSON.stringify({ command });
-    uiClients.forEach(client => {
-        if (!client.writableEnded) {
-            client.write(`data: ${data}\n\n`);
-        }
-    });
-}
-
-// Screenshot handling
-const pendingScreenshots = new Map();
-
-function requestScreenshot(width = 800, height = 600) {
-    return new Promise((resolve, reject) => {
-        if (uiClients.size === 0) {
-            reject(new Error('No browser UI connected'));
-            return;
-        }
-
-        const requestId = randomUUID();
-        const timeout = setTimeout(() => {
-            pendingScreenshots.delete(requestId);
-            reject(new Error('Screenshot timeout'));
-        }, 10000);
-
-        pendingScreenshots.set(requestId, { resolve, reject, timeout });
-
-        const request = JSON.stringify({
-            type: 'screenshot_request',
-            requestId,
-            width,
-            height
-        });
-
-        for (const client of uiClients) {
-            if (!client.writableEnded) {
-                client.write(`data: ${request}\n\n`);
-                break;
-            }
-        }
-    });
-}
 
 // ============================================================================
 // MCP ENDPOINT
@@ -678,7 +332,7 @@ async function handleMcpMessage(message, session) {
                 result: {
                     protocolVersion: '2024-11-05',
                     capabilities: { tools: { listChanged: true } },
-                    serverInfo: { name: 'robo-demo', version: '2.0.0' }
+                    serverInfo: { name: 'robo-demo', version: '3.0.0' }
                 }
             };
 
@@ -694,44 +348,43 @@ async function handleMcpMessage(message, session) {
                 return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing tool name' } };
             }
 
-            if (name === 'take_screenshot') {
-                try {
-                    const width = args?.width || 800;
-                    const height = args?.height || 600;
-                    const imageData = await requestScreenshot(width, height);
-                    return {
-                        jsonrpc: '2.0',
-                        id,
-                        result: {
-                            content: [{
-                                type: 'image',
-                                data: imageData,
-                                mimeType: 'image/png'
-                            }]
-                        }
-                    };
-                } catch (error) {
-                    return {
-                        jsonrpc: '2.0',
-                        id,
-                        result: {
-                            content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message }) }]
-                        }
-                    };
-                }
+            // Sync tools: handle directly on server
+            const syncResult = executeSyncTool(name, args || {});
+            if (syncResult !== null) {
+                return {
+                    jsonrpc: '2.0',
+                    id,
+                    result: {
+                        content: [{ type: 'text', text: JSON.stringify(syncResult, null, 2) }]
+                    }
+                };
             }
 
-            const result = executeTool(name, args || {});
-
-            // Handle async task tools
-            if (result === 'ASYNC_TASK') {
+            // Async tools: delegate to browser via command queue
+            if (ASYNC_TOOLS.has(name)) {
                 try {
-                    const asyncResult = await executeAsyncTool(name, args || {});
+                    const result = await executeViaCommandQueue(name, args || {});
+
+                    // Screenshot returns image data
+                    if (result.imageData) {
+                        return {
+                            jsonrpc: '2.0',
+                            id,
+                            result: {
+                                content: [{
+                                    type: 'image',
+                                    data: result.imageData,
+                                    mimeType: 'image/png'
+                                }]
+                            }
+                        };
+                    }
+
                     return {
                         jsonrpc: '2.0',
                         id,
                         result: {
-                            content: [{ type: 'text', text: JSON.stringify(asyncResult, null, 2) }]
+                            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
                         }
                     };
                 } catch (error) {
@@ -748,9 +401,7 @@ async function handleMcpMessage(message, session) {
             return {
                 jsonrpc: '2.0',
                 id,
-                result: {
-                    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-                }
+                error: { code: -32602, message: `Unknown tool: ${name}` }
             };
         }
 
@@ -783,16 +434,41 @@ app.get('/api/state', (req, res) => {
     res.json({
         jointTargets: [...armState.jointTargets],
         magnetOn: armState.magnetOn,
+        attachedObject: armState.attachedObject,
         objects: armState.objects,
-        jointLimits
+        jointLimits,
+        pendingCommand: armState.pendingCommand
     });
+});
+
+// Browser posts command result after executing locally
+app.post('/api/command-result', (req, res) => {
+    const { commandId, ...result } = req.body;
+    if (!commandId) {
+        return res.status(400).json({ error: 'Missing commandId' });
+    }
+
+    armState.commandResult = { commandId, ...result };
+
+    // Sync state updates from the browser
+    if (result.jointTargets) {
+        armState.jointTargets = result.jointTargets;
+    }
+    if (result.magnetOn !== undefined) {
+        armState.magnetOn = result.magnetOn;
+    }
+    if (result.attachedObject !== undefined) {
+        armState.attachedObject = result.attachedObject;
+    }
+
+    saveState();
+    res.json({ success: true });
 });
 
 // Update object positions from browser (for persistence)
 app.post('/api/objects', (req, res) => {
     const { objects } = req.body;
     if (Array.isArray(objects)) {
-        // Merge position updates while preserving type/size/color info
         objects.forEach(update => {
             const existing = armState.objects.find(o => o.id === update.id);
             if (existing) {
@@ -804,15 +480,8 @@ app.post('/api/objects', (req, res) => {
     res.json({ success: true });
 });
 
-// Motion status reporting from browser
+// Motion status reporting from browser (kept for backward compat)
 app.post('/api/motion-status', (req, res) => {
-    const { complete, jointAngles } = req.body;
-    motionComplete = complete;
-
-    if (complete && motionCompleteResolve) {
-        motionCompleteResolve();
-    }
-
     res.json({ success: true });
 });
 
@@ -822,9 +491,6 @@ app.post('/api/attachment-status', (req, res) => {
 
     if (attached) {
         armState.attachedObject = objectId;
-        if (attachmentResolve) {
-            attachmentResolve(objectId);
-        }
     } else if (armState.attachedObject === objectId) {
         armState.attachedObject = null;
     }
@@ -838,34 +504,15 @@ app.post('/api/tools/:name', (req, res) => {
     if (!tool) {
         return res.status(404).json({ error: 'Tool not found' });
     }
-    const result = executeTool(req.params.name, req.body);
-    if (result === 'SCREENSHOT_REQUEST') {
-        return res.status(400).json({ error: 'Use MCP endpoint for screenshots' });
+    const syncResult = executeSyncTool(req.params.name, req.body);
+    if (syncResult !== null) {
+        return res.json(syncResult);
     }
-    res.json(result);
+    res.status(400).json({ error: 'Use MCP endpoint for async tools' });
 });
 
 app.get('/api/tools', (req, res) => {
     res.json({ tools: mcpTools });
-});
-
-app.post('/api/screenshot', (req, res) => {
-    const { requestId, imageData, error } = req.body;
-    const pending = pendingScreenshots.get(requestId);
-    if (!pending) {
-        return res.status(404).json({ error: 'No pending screenshot request' });
-    }
-
-    clearTimeout(pending.timeout);
-    pendingScreenshots.delete(requestId);
-
-    if (error) {
-        pending.reject(new Error(error));
-    } else {
-        pending.resolve(imageData);
-    }
-
-    res.json({ success: true });
 });
 
 app.get('/health', (req, res) => {
@@ -883,7 +530,7 @@ const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
 if (isMainModule) {
     app.listen(PORT, () => {
         console.log(`
-🤖 Robo Demo Server v2.0
+🤖 Robo Demo Server v3.0 (client-side execution)
 
    Web UI:       http://localhost:${PORT}
    MCP Endpoint: http://localhost:${PORT}/mcp

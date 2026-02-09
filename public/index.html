@@ -245,6 +245,285 @@
             }).catch(() => {});
         }
 
+        // ====================================================================
+        // CLIENT-SIDE IK SOLVER & TASK EXECUTION
+        // ====================================================================
+
+        const ARM_IK = {
+            baseHeight: 0.1,
+            L1: 0.35,
+            L2: 0.30,
+            L3: 0.35,
+            reachRadius: 0.80,
+            maxHeight: 0.95,
+            minHeight: 0.05
+        };
+
+        const IK_JOINT_LIMITS = [
+            [-180, 180], [-90, 90], [-135, 135],
+            [-180, 180], [-90, 90], [-180, 180]
+        ];
+
+        function solveIK(targetPos) {
+            const { baseHeight, L1, L2, L3 } = ARM_IK;
+            const theta0 = Math.atan2(targetPos.x, targetPos.z);
+            const r = Math.sqrt(targetPos.x ** 2 + targetPos.z ** 2);
+            const h = targetPos.y - baseHeight - L3;
+            const d = Math.sqrt(r ** 2 + h ** 2);
+            if (d > L1 + L2 - 0.01 || d < Math.abs(L1 - L2) + 0.01) return null;
+            const cos_theta2 = (d ** 2 - L1 ** 2 - L2 ** 2) / (2 * L1 * L2);
+            const theta2 = -Math.acos(Math.max(-1, Math.min(1, cos_theta2)));
+            const alpha = Math.atan2(h, r);
+            const cos_beta = (L1 ** 2 + d ** 2 - L2 ** 2) / (2 * L1 * d);
+            const beta = Math.acos(Math.max(-1, Math.min(1, cos_beta)));
+            const theta1 = alpha + beta - Math.PI / 2;
+            const theta3 = 0;
+            const theta4 = -(theta1 + theta2);
+            const theta5 = -theta0;
+            return [theta0, theta1, theta2, theta3, theta4, theta5].map((rad, i) => {
+                const deg = rad * 180 / Math.PI;
+                return Math.max(IK_JOINT_LIMITS[i][0], Math.min(IK_JOINT_LIMITS[i][1], deg));
+            });
+        }
+
+        function localSleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function waitForLocalMotionComplete(timeoutMs = 10000) {
+            return new Promise((resolve) => {
+                const startTime = Date.now();
+                function check() {
+                    if (checkMotionComplete()) {
+                        resolve(true);
+                    } else if (Date.now() - startTime > timeoutMs) {
+                        resolve(false);
+                    } else {
+                        requestAnimationFrame(check);
+                    }
+                }
+                check();
+            });
+        }
+
+        async function localMoveTo(position) {
+            const angles = solveIK(position);
+            if (!angles) throw new Error('OUT_OF_REACH');
+            for (let i = 0; i < 6; i++) {
+                jointTargets[i] = angles[i];
+                updateSliderUI(i, angles[i]);
+            }
+            await waitForLocalMotionComplete();
+            await localSleep(100);
+        }
+
+        async function localSetMagnet(enabled) {
+            magnetOn = enabled;
+            updateMagnetUI();
+            await localSleep(200);
+        }
+
+        function getObjectPosition(objectId) {
+            const entry = objectBodies.get(objectId);
+            if (!entry) return null;
+            const pos = entry.body.translation();
+            return { x: pos.x, y: pos.y, z: pos.z };
+        }
+
+        function waitForLocalAttachment(objectId, timeoutMs = 3000) {
+            return new Promise((resolve) => {
+                const startTime = Date.now();
+                function check() {
+                    const entry = objectBodies.get(objectId);
+                    if (entry && entry.mesh.userData.attached) {
+                        resolve(true);
+                    } else if (Date.now() - startTime > timeoutMs) {
+                        resolve(false);
+                    } else {
+                        requestAnimationFrame(check);
+                    }
+                }
+                check();
+            });
+        }
+
+        // Task execution functions (run entirely in the browser)
+        async function localExecutePickObject(objectId) {
+            const startTime = Date.now();
+            const pos = getObjectPosition(objectId);
+            if (!pos) {
+                return { success: false, message: `Object '${objectId}' not found`, error_code: 'OBJECT_NOT_FOUND', duration_ms: Date.now() - startTime };
+            }
+            if (magnetOn && attachedObject) {
+                return { success: false, message: `Already holding object '${attachedObject}'`, error_code: 'ALREADY_HOLDING_OBJECT', duration_ms: Date.now() - startTime };
+            }
+            try {
+                const abovePos = { x: pos.x, y: 0.30, z: pos.z };
+                const pickPos = { x: pos.x, y: pos.y + 0.12, z: pos.z };
+                const liftPos = { x: pos.x, y: 0.35, z: pos.z };
+                await localMoveTo(abovePos);
+                await localMoveTo(pickPos);
+                await localSetMagnet(true);
+                await waitForLocalAttachment(objectId, 2000);
+                await localSleep(300);
+                await localMoveTo(liftPos);
+                return { success: true, message: `Successfully picked up '${objectId}'`, error_code: null, duration_ms: Date.now() - startTime };
+            } catch (error) {
+                return { success: false, message: error.message, error_code: error.message, duration_ms: Date.now() - startTime };
+            }
+        }
+
+        async function localExecuteCarryTo(x, y, z) {
+            const startTime = Date.now();
+            if (!magnetOn || !attachedObject) {
+                return { success: false, message: 'Not holding any object', error_code: 'NO_OBJECT_HELD', duration_ms: Date.now() - startTime };
+            }
+            try {
+                await localMoveTo({ x, y, z });
+                return { success: true, message: `Carried object to (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`, error_code: null, duration_ms: Date.now() - startTime };
+            } catch (error) {
+                return { success: false, message: error.message, error_code: error.message, duration_ms: Date.now() - startTime };
+            }
+        }
+
+        async function localExecutePlaceObject(params = {}) {
+            const startTime = Date.now();
+            if (!magnetOn || !attachedObject) {
+                return { success: false, message: 'Not holding any object', error_code: 'NO_OBJECT_HELD', duration_ms: Date.now() - startTime };
+            }
+            const objectId = attachedObject;
+            try {
+                if (params.x !== undefined && params.y !== undefined && params.z !== undefined) {
+                    await localMoveTo({ x: params.x, y: params.y, z: params.z });
+                }
+                await localSetMagnet(false);
+                await localSleep(500);
+                return { success: true, message: `Placed object '${objectId}'`, error_code: null, duration_ms: Date.now() - startTime };
+            } catch (error) {
+                return { success: false, message: error.message, error_code: error.message, duration_ms: Date.now() - startTime };
+            }
+        }
+
+        async function localExecuteDance(durationSeconds) {
+            const startTime = Date.now();
+            const danceFrames = [
+                [0, 0, 0, 0, 0, 0],
+                [45, 20, -30, 0, 10, 90],
+                [-45, 20, -30, 0, 10, -90],
+                [0, 45, -90, 45, 30, 0],
+                [0, -10, 30, 0, -20, 180],
+                [90, 30, -60, 90, 0, 45],
+                [-90, 30, -60, -90, 0, -45],
+                [0, 0, 0, 0, 0, 0],
+            ];
+            const frameTime = (durationSeconds * 1000) / danceFrames.length;
+            for (const frame of danceFrames) {
+                for (let i = 0; i < 6; i++) {
+                    jointTargets[i] = frame[i];
+                    updateSliderUI(i, frame[i]);
+                }
+                await localSleep(frameTime);
+                await waitForLocalMotionComplete(5000);
+            }
+            return { success: true, message: `Dance completed (${durationSeconds}s)`, error_code: null, duration_ms: Date.now() - startTime };
+        }
+
+        async function localExecuteResetToBase() {
+            const startTime = Date.now();
+            if (magnetOn) {
+                await localSetMagnet(false);
+                await localSleep(300);
+            }
+            for (let i = 0; i < 6; i++) {
+                jointTargets[i] = 0;
+                updateSliderUI(i, 0);
+            }
+            await waitForLocalMotionComplete();
+            return { success: true, message: 'Arm reset to home position', error_code: null, duration_ms: Date.now() - startTime };
+        }
+
+        async function localTakeScreenshot(width, height) {
+            try {
+                const container = document.getElementById('canvas-container');
+                const origWidth = container.clientWidth;
+                const origHeight = container.clientHeight;
+                const w = width || 800;
+                const h = height || 600;
+                renderer.setSize(w, h);
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                renderer.render(scene, camera);
+                const imageData = renderer.domElement.toDataURL('image/png').split(',')[1];
+                renderer.setSize(origWidth, origHeight);
+                camera.aspect = origWidth / origHeight;
+                camera.updateProjectionMatrix();
+                return { imageData };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        }
+
+        // Command queue processing
+        let processingCommand = false;
+        let lastProcessedCommandId = null;
+
+        async function processCommand(command) {
+            if (processingCommand) return;
+            if (command.id === lastProcessedCommandId) return;
+            processingCommand = true;
+            console.log(`[MCP] Executing: ${command.tool}`, command.args);
+
+            let result;
+            try {
+                switch (command.tool) {
+                    case 'pick_object':
+                        result = await localExecutePickObject(command.args.object_id);
+                        break;
+                    case 'carry_to':
+                        result = await localExecuteCarryTo(command.args.x, command.args.y, command.args.z);
+                        break;
+                    case 'place_object':
+                        result = await localExecutePlaceObject(command.args);
+                        break;
+                    case 'dance':
+                        result = await localExecuteDance(command.args.duration_seconds || 5);
+                        break;
+                    case 'reset_to_base':
+                        result = await localExecuteResetToBase();
+                        break;
+                    case 'take_screenshot':
+                        result = await localTakeScreenshot(command.args.width, command.args.height);
+                        break;
+                    default:
+                        result = { success: false, error: `Unknown command: ${command.tool}` };
+                }
+            } catch (error) {
+                result = { success: false, error: error.message };
+            }
+
+            console.log(`[MCP] Result:`, result.success !== undefined ? result.success : 'screenshot');
+
+            // Post result back to server
+            try {
+                await fetch(`${API_BASE}/api/command-result`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        commandId: command.id,
+                        ...result,
+                        jointTargets: [...jointTargets],
+                        magnetOn,
+                        attachedObject
+                    })
+                });
+            } catch (e) {
+                console.error('[MCP] Failed to post command result:', e);
+            }
+
+            lastProcessedCommandId = command.id;
+            processingCommand = false;
+        }
+
         // Three.js objects
         let scene, camera, renderer, controls;
         const armSegments = [];
@@ -911,8 +1190,16 @@
                     if (!res.ok) return;
                     const state = await res.json();
 
+                    // Check for pending MCP command from server
+                    if (state.pendingCommand && !processingCommand) {
+                        processCommand(state.pendingCommand);
+                        return; // Skip normal state sync while processing
+                    }
+
                     // Skip state sync while user is actively controlling
                     if (userIsControlling) return;
+                    // Skip state sync while executing a command
+                    if (processingCommand) return;
 
                     // Apply joint target changes from server (MCP commands)
                     if (state.jointTargets) {
