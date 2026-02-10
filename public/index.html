@@ -885,6 +885,40 @@
             }
         }
 
+        async function handleScreenshotRequest(data) {
+            const { requestId, width, height } = data;
+            try {
+                // Render a fresh frame at the requested size
+                const originalWidth = renderer.domElement.width;
+                const originalHeight = renderer.domElement.height;
+
+                renderer.setSize(width || 800, height || 600);
+                camera.aspect = (width || 800) / (height || 600);
+                camera.updateProjectionMatrix();
+                renderer.render(scene, camera);
+
+                const imageData = renderer.domElement.toDataURL('image/png');
+
+                // Restore original size
+                renderer.setSize(originalWidth, originalHeight);
+                camera.aspect = originalWidth / originalHeight;
+                camera.updateProjectionMatrix();
+
+                await fetch(`${API_BASE}/api/screenshot`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ requestId, imageData })
+                });
+            } catch (e) {
+                console.error('Screenshot capture failed:', e);
+                await fetch(`${API_BASE}/api/screenshot`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ requestId, error: e.message })
+                });
+            }
+        }
+
         function connectSSE() {
             const eventSource = new EventSource(`${API_BASE}/api/events`);
 
@@ -893,6 +927,9 @@
                 if (data.type === 'connected') {
                     document.getElementById('mcp-connected').textContent = 'Connected';
                     document.getElementById('mcp-connected').style.color = '#2ecc71';
+                }
+                if (data.type === 'screenshot_request') {
+                    handleScreenshotRequest(data);
                 }
                 if (data.command) {
                     handleServerCommand(data.command);
