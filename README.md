@@ -232,5 +232,5 @@ For MCP clients that support HTTP/SSE transport (like Claude Desktop with remote
 
 ```bash
 # Run with auto-reload
-npx nodemon server.js
+npm run dev
 ```
